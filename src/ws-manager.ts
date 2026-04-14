@@ -95,31 +95,44 @@ export class WsManager extends EventEmitter {
     if (this.tokenIds.length === 0) return;
 
     const msg = JSON.stringify({
+      auth: {},
       type: 'subscribe',
-      channels: [{ name: 'book', token_ids: this.tokenIds }],
+      channel: 'book',
+      markets: [],
+      assets_ids: this.tokenIds,
     });
     this.ws.send(msg);
     logger.info(`[WS] Subscribed to ${this.tokenIds.length} token(s)`);
   }
 
   private handleMessage(msg: any): void {
-    const eventType: string = msg.event_type ?? msg.type ?? '';
+    // The CLOB WS sends two shapes:
+    //
+    // 1. Book snapshot — JSON array, sent once on subscribe:
+    //    [{ market, asset_id, bids: [{price,size},...], asks: [...] }]
+    //    NOTE: bids/asks contain the full sparse depth (eg. bid=0.01, ask=0.99
+    //    for neg_risk markets). Do NOT compute mid from these — the first
+    //    price_changes message carries the authoritative best_bid / best_ask.
+    //
+    // 2. Price-change update — single object sent on every trade/quote change:
+    //    { market, price_changes: [{ asset_id, side, price, size, best_bid, best_ask }] }
 
-    if (eventType === 'book_snapshot' || eventType === 'book') {
-      const tokenId: string = msg.asset_id ?? msg.market ?? '';
-      if (!tokenId) return;
+    if (Array.isArray(msg)) {
+      // Shape 1: snapshot — subscription confirmed, discard for mid purposes
+      return;
+    }
 
-      const bids: Array<{ price: string; size: string }> = msg.bids ?? [];
-      const asks: Array<{ price: string; size: string }> = msg.asks ?? [];
-
-      if (bids.length === 0 && asks.length === 0) return;
-
-      const bestBid = bids.length > 0 ? Math.max(...bids.map(b => parseFloat(b.price))) : null;
-      const bestAsk = asks.length > 0 ? Math.min(...asks.map(a => parseFloat(a.price))) : null;
-
-      if (bestBid !== null && bestAsk !== null && bestBid > 0 && bestAsk > 0 && bestBid < bestAsk) {
-        const mid = (bestBid + bestAsk) / 2;
-        this.emit('midUpdate', tokenId, mid);
+    if (msg.price_changes && Array.isArray(msg.price_changes)) {
+      // Shape 2: incremental update with authoritative best_bid / best_ask
+      for (const change of msg.price_changes) {
+        const tokenId: string = change.asset_id;
+        if (!tokenId) continue;
+        const bestBid = parseFloat(change.best_bid);
+        const bestAsk = parseFloat(change.best_ask);
+        if (isFinite(bestBid) && isFinite(bestAsk) && bestBid > 0 && bestAsk > 0 && bestBid < bestAsk) {
+          const mid = (bestBid + bestAsk) / 2;
+          this.emit('midUpdate', tokenId, mid);
+        }
       }
     }
   }

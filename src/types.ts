@@ -1,24 +1,21 @@
 export interface MarketConfig {
-  condition_id: string;
-  yes_token_id: string;
+  /** Polymarket market/event URL — alternative to specifying condition_id + yes_token_id directly */
+  url?: string;
+  condition_id?: string;
+  yes_token_id?: string;
+  no_token_id?: string;
   min_size: number;
   fallback_v: number;
   // optional per-market overrides
   spread_factor?: number;
   refresh_interval_ms?: number;
-  min_requote_interval_ms?: number;
   drift_threshold_factor?: number;
-  min_mid_price?: number;
-  max_mid_price?: number;
 }
 
 export interface Defaults {
   spread_factor: number;
   refresh_interval_ms: number;
-  min_requote_interval_ms: number;
   drift_threshold_factor: number;
-  min_mid_price: number;
-  max_mid_price: number;
   ws_host: string;
 }
 
@@ -27,7 +24,7 @@ export interface AppConfig {
   markets: MarketConfig[];
 }
 
-export interface ResolvedMarketConfig extends Required<MarketConfig> {
+export interface ResolvedMarketConfig extends Omit<Required<MarketConfig>, 'url'> {
   ws_host: string;
 }
 

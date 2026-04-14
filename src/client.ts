@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { ClobClient, Side, SignatureType } from '@polymarket/clob-client';
+import { ClobClient, Side, SignatureType, AssetType } from '@polymarket/clob-client';
 import logger from './logger';
 
 export interface MarketInfo {
@@ -10,24 +10,54 @@ export interface MarketInfo {
 
 let client: ClobClient;
 let heartbeatTimer: NodeJS.Timeout;
+let lastHeartbeatId: string | null = null;
 
 export async function initClient(host: string, chainId: number, privateKey: string): Promise<void> {
   const signer = new ethers.Wallet(privateKey);
+  const proxyAddress = process.env.POLYMARKET_PROXY_ADDRESS;
 
   // Step 1: L1-only client to derive API credentials
   const l1Client = new ClobClient(host, chainId, signer);
   const apiCreds = await l1Client.createOrDeriveApiKey();
   logger.info('[Client] API credentials derived');
 
-  // Step 2: Full client with L2 auth credentials
-  client = new ClobClient(host, chainId, signer, apiCreds, SignatureType.EOA);
+  // Step 2: Full client with correct signature type
+  // - POLY_GNOSIS_SAFE (2): Web3 wallet login (OKX, MetaMask) — requires proxyAddress (Polymarket Profile Address)
+  // - EOA (0): direct EOA login without proxy
+  const sigType = proxyAddress ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
+  client = new ClobClient(host, chainId, signer, apiCreds, sigType, proxyAddress);
+  logger.info(`[Client] Using signatureType=${sigType} proxyAddress=${proxyAddress ?? 'none (EOA mode)'}`);
 
-  // Heartbeat: post every 5s to keep orders alive
+  // Log USDC balance and allowance so misconfigured accounts are caught early
+  try {
+    await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }) as any;
+    logger.info(`[Client] Raw balance response: ${JSON.stringify(bal)}`);
+  } catch (err) {
+    logger.warn('[Client] Could not fetch balance/allowance:', err);
+  }
+
+  // Heartbeat: post every 5s to keep orders alive.
+  // postHeartbeat() requires chaining: pass the previous heartbeat_id back each time.
+  // If heartbeats lapse for 10s, the exchange auto-cancels all orders.
   heartbeatTimer = setInterval(async () => {
     try {
-      await client.postHeartbeat();
+      const resp = await client.postHeartbeat(lastHeartbeatId);
+      const r = resp as any;
+      if (r.error || r.status >= 400) {
+        // Chain broke — start a new one
+        logger.warn(`[Client] Heartbeat chain invalid, restarting: ${JSON.stringify(r)}`);
+        const fresh = await client.postHeartbeat();
+        lastHeartbeatId = (fresh as any).heartbeat_id ?? null;
+        logger.info(`[Client] New heartbeat chain: ${lastHeartbeatId}`);
+      } else {
+        lastHeartbeatId = r.heartbeat_id ?? lastHeartbeatId;
+        logger.debug(`[Client] Heartbeat OK (id=${lastHeartbeatId})`);
+      }
     } catch (err) {
-      logger.warn('[Client] Heartbeat failed:', err);
+      logger.error('[Client] Heartbeat FAILED:', err);
+      // Try to restart chain on next tick
+      lastHeartbeatId = null;
     }
   }, 5000);
 }
@@ -39,9 +69,25 @@ export function stopHeartbeat(): void {
 export async function getMarketInfo(conditionId: string, fallbackV: number): Promise<MarketInfo> {
   try {
     const market = await client.getMarket(conditionId);
-    const v = (market as any).max_spread ?? fallbackV;
-    const tick_size = (market as any).minimum_tick_size ?? 0.01;
-    const rewards_daily_rate = (market as any).rewards_daily_rate;
+    const m = market as any;
+    const tick_size = parseFloat(m.minimum_tick_size) || 0.01;
+
+    // max_spread comes from the rewards API, not getMarket
+    let v = fallbackV;
+    let rewards_daily_rate: number | undefined;
+    try {
+      const rewardsData = await (client as any).getRawRewardsForMarket(conditionId);
+      const reward = Array.isArray(rewardsData) ? rewardsData[0] : rewardsData;
+      if (reward?.rewards_max_spread) {
+        // rewards_max_spread is in percentage (e.g. 5.5 means 5.5% = 0.055)
+        v = reward.rewards_max_spread / 100;
+      }
+      rewards_daily_rate = reward?.rewards_config?.[0]?.rate_per_day;
+    } catch {
+      // rewards API not available, use fallback
+    }
+
+    logger.info(`[Client] getMarketInfo: v=${v} tick_size=${tick_size} rewards_daily_rate=${rewards_daily_rate}`);
     return { v, tick_size, rewards_daily_rate };
   } catch (err) {
     logger.warn(`[Client] getMarketInfo failed for ${conditionId}, using fallback:`, err);
@@ -51,24 +97,30 @@ export async function getMarketInfo(conditionId: string, fallbackV: number): Pro
 
 export async function getRestMid(tokenId: string): Promise<number | null> {
   try {
-    const book = await client.getOrderBook(tokenId);
-    const bids: Array<{ price: string; size: string }> = (book as any).bids ?? [];
-    const asks: Array<{ price: string; size: string }> = (book as any).asks ?? [];
-    if (bids.length === 0 || asks.length === 0) return null;
-    const bestBid = Math.max(...bids.map(b => parseFloat(b.price)));
-    const bestAsk = Math.min(...asks.map(a => parseFloat(a.price)));
-    if (bestBid <= 0 || bestAsk <= 0 || bestBid >= bestAsk) return null;
+    const [bidResp, askResp] = await Promise.all([
+      client.getPrice(tokenId, 'BUY'),
+      client.getPrice(tokenId, 'SELL'),
+    ]);
+    logger.info(`[Client] getRestMid token=${tokenId.slice(0, 10)}... bid=${JSON.stringify(bidResp)} ask=${JSON.stringify(askResp)}`);
+    const bestBid = parseFloat((bidResp as any).price);
+    const bestAsk = parseFloat((askResp as any).price);
+    if (!isFinite(bestBid) || !isFinite(bestAsk) || bestBid <= 0 || bestAsk <= 0 || bestBid >= bestAsk) return null;
     return (bestBid + bestAsk) / 2;
   } catch (err) {
-    logger.warn(`[Client] getRestMid failed for token ${tokenId}:`, err);
+    logger.info(`[Client] getRestMid unavailable for token ${tokenId.slice(0, 10)}...:`, err);
     return null;
   }
+}
+
+export async function getOpenOrders(conditionId: string): Promise<any[]> {
+  const resp = await client.getOpenOrders({ market: conditionId } as any);
+  return Array.isArray(resp) ? resp : [];
 }
 
 export async function cancelMarketOrders(conditionId: string): Promise<void> {
   try {
     await client.cancelMarketOrders({ market: conditionId } as any);
-    logger.debug(`[Client] Cancelled orders for market ${conditionId.slice(0, 10)}...`);
+    logger.info(`[Client] Cancelled orders for market ${conditionId.slice(0, 10)}...`);
   } catch (err) {
     logger.warn(`[Client] cancelMarketOrders failed for ${conditionId}:`, err);
   }
@@ -88,8 +140,15 @@ export async function placeLimitOrder(
       size,
     });
     const resp = await client.postOrder(order, 'GTC' as any);
-    const orderId = (resp as any).orderID ?? (resp as any).order_id ?? 'unknown';
-    logger.debug(`[Client] Placed ${side} @ ${price} size=${size} → orderId=${orderId}`);
+    const r = resp as any;
+    logger.info(`[Client] postOrder response ${side}@${price}: ${JSON.stringify(r)}`);
+    if (r.error) {
+      const msg = r.error ?? r.errorMsg ?? 'unknown error';
+      logger.warn(`[Client] placeLimitOrder rejected ${side}@${price}: ${msg} (status=${r.status})`);
+      return null;
+    }
+    const orderId = r.orderID ?? r.order_id ?? 'unknown';
+    logger.info(`[Client] Placed ${side} @ ${price} size=${size} token=${tokenId.slice(0, 10)}... → orderId=${orderId}`);
     return orderId;
   } catch (err) {
     logger.warn(`[Client] placeLimitOrder failed ${side}@${price}:`, err);

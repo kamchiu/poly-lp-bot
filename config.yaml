@@ -1,15 +1,30 @@
 defaults:
   spread_factor: 0.8             # s = v * spread_factor (stay inside blue line)
-  refresh_interval_ms: 18000    # 3min forced refresh (fallback)
-  min_requote_interval_ms: 3000 # min cooldown between WS-triggered requotes
-  drift_threshold_factor: 0.15   # requote when mid drifts > v * this value
-  min_mid_price: 0.10            # skip when mid < this (edge penalty)
-  max_mid_price: 0.90            # skip when mid > this (edge penalty)
+  refresh_interval_ms: 70000    # 3min refresh after each requote completes
+  drift_threshold_factor: 0.6    # requote when mid drifts > fallback_v * this (e.g. 0.05*1.0=0.05 → 5¢)
   ws_host: wss://ws-subscriptions-clob.polymarket.com/ws/market
 
 markets:
-  - condition_id: "0xYOUR_CONDITION_ID_HERE"
-    yes_token_id: "YOUR_YES_TOKEN_ID_HERE"
-    min_size: 50                 # minimum qualifying size (USDC)
-    fallback_v: 0.05             # fallback max_spread if API returns none
-    # spread_factor: 0.75        # optional per-market override
+  # Option A: paste the Polymarket URL — condition_id and yes_token_id are resolved automatically
+  - url: "https://polymarket.com/event/cory-mills-out-as-us-rep-by-may-31/cory-mills-out-as-us-rep-by-may-31"
+    min_size: 20
+    fallback_v: 0.05
+    spread_factor: 0.7        # optional per-market override
+
+  # Option B: specify IDs directly (original method, still supported)
+  # - condition_id: "0xYOUR_CONDITION_ID_HERE"
+  #   yes_token_id: "YOUR_YES_TOKEN_ID_HERE"
+  #   min_size: 50
+  #   fallback_v: 0.05
+
+  - url: "https://polymarket.com/event/will-the-us-invade-iran-before-2027/will-the-us-invade-iran-before-2027"
+    min_size: 200
+    fallback_v: 0.04
+
+  - url: "https://polymarket.com/event/fl-06-republican-primary-winner/will-alexandra-van-cleef-be-the-republican-nominee-for-fl-06"
+    min_size: 20
+    fallback_v: 0.05
+
+  - url: "https://polymarket.com/event/madison-air-ipo-closing-market-cap/will-madison-airs-market-cap-be-greater-than-13pt5b-at-market-close-on-ipo-day"
+    min_size: 200
+    fallback_v: 0.04

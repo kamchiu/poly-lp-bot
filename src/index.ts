@@ -1,6 +1,6 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
-import { loadConfig, resolveMarketConfig } from './config';
+import { loadConfig, resolveMarketConfig, resolveMarketIds } from './config';
 import { initClient, stopHeartbeat, cancelMarketOrders } from './client';
 import { WsManager } from './ws-manager';
 import { MarketMaker } from './market-maker';
@@ -25,14 +25,15 @@ async function main() {
   // 2. Init REST client, derive API key, start heartbeat
   await initClient(clobHost, chainId, privateKey);
 
-  // 3. Resolve per-market configs
+  // 3. Resolve market IDs from URLs (if any), then build per-market configs
+  await resolveMarketIds(appConfig.markets);
   const resolvedMarkets = appConfig.markets.map(m =>
     resolveMarketConfig(m, appConfig.defaults)
   );
 
-  // 4. Init WS manager and subscribe to all token IDs
+  // 4. Init WS manager and subscribe to all token IDs (YES + NO)
   const wsManager = new WsManager(appConfig.defaults.ws_host);
-  const tokenIds = resolvedMarkets.map(m => m.yes_token_id);
+  const tokenIds = resolvedMarkets.flatMap(m => [m.yes_token_id, m.no_token_id]);
   wsManager.subscribe(tokenIds);
   wsManager.connect();
 
