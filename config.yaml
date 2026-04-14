@@ -1,0 +1,15 @@
+defaults:
+  spread_factor: 0.8             # s = v * spread_factor (stay inside blue line)
+  refresh_interval_ms: 18000    # 3min forced refresh (fallback)
+  min_requote_interval_ms: 3000 # min cooldown between WS-triggered requotes
+  drift_threshold_factor: 0.15   # requote when mid drifts > v * this value
+  min_mid_price: 0.10            # skip when mid < this (edge penalty)
+  max_mid_price: 0.90            # skip when mid > this (edge penalty)
+  ws_host: wss://ws-subscriptions-clob.polymarket.com/ws/market
+
+markets:
+  - condition_id: "0xYOUR_CONDITION_ID_HERE"
+    yes_token_id: "YOUR_YES_TOKEN_ID_HERE"
+    min_size: 50                 # minimum qualifying size (USDC)
+    fallback_v: 0.05             # fallback max_spread if API returns none
+    # spread_factor: 0.75        # optional per-market override

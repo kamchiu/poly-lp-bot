@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:polymarket.com)",
+      "WebFetch(domain:clob.polymarket.com)",
+      "WebFetch(domain:blog.polymarket.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:help.polymarket.com)",
+      "Bash(node:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm test:*)"
+    ]
+  }
+}
