@@ -3,7 +3,7 @@
 defaults:
   spread_factor: 0.7
   refresh_interval_ms: 70000
-  drift_threshold_factor: 0.4
+  drift_threshold_factor: 0.25
   ws_host: wss://ws-subscriptions-clob.polymarket.com/ws/market
   fill_poll_interval_ms: 3000
 markets:
