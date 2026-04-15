@@ -12,7 +12,9 @@
       "Bash(npx tsc:*)",
       "Bash(npm test:*)",
       "Bash(curl -s \"https://gamma-api.polymarket.com/events?slug=will-the-us-invade-iran-before-2027\")",
-      "Bash(python3 -c ':*)"
+      "Bash(python3 -c ':*)",
+      "Bash(curl -s \"https://clob.polymarket.com/rewards/markets/current?next_cursor=MA==\")",
+      "Bash(curl -s 'https://gamma-api.polymarket.com/markets?condition_id=__TRACKED_VAR__')"
     ]
   }
 }

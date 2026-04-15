@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { ClobClient, Side, SignatureType, AssetType } from '@polymarket/clob-client';
+import { ClobClient, Side, SignatureType, AssetType, OrderType } from '@polymarket/clob-client';
 import logger from './logger';
 
 export interface MarketInfo {
@@ -153,5 +153,76 @@ export async function placeLimitOrder(
   } catch (err) {
     logger.warn(`[Client] placeLimitOrder failed ${side}@${price}:`, err);
     return null;
+  }
+}
+
+export interface OrderStatus {
+  sizeMatched: number;
+  originalSize: number;
+  status: string;
+  price: number;
+  assetId: string;
+}
+
+export async function getOrderStatus(orderId: string): Promise<OrderStatus | null> {
+  try {
+    const order = await client.getOrder(orderId);
+    const o = order as any;
+    return {
+      sizeMatched: parseFloat(o.size_matched) || 0,
+      originalSize: parseFloat(o.original_size) || 0,
+      status: o.status ?? '',
+      price: parseFloat(o.price) || 0,
+      assetId: o.asset_id ?? '',
+    };
+  } catch (err) {
+    logger.warn(`[Client] getOrderStatus failed for ${orderId}:`, err);
+    return null;
+  }
+}
+
+export async function cancelOrder(orderId: string): Promise<void> {
+  try {
+    await client.cancelOrder({ orderID: orderId });
+    logger.info(`[Client] Cancelled order ${orderId}`);
+  } catch (err) {
+    logger.warn(`[Client] cancelOrder failed for ${orderId}:`, err);
+  }
+}
+
+export async function placeMarketSellOrder(tokenId: string, amount: number): Promise<string | null> {
+  try {
+    const order = await client.createMarketOrder({
+      tokenID: tokenId,
+      amount,
+      side: Side.SELL,
+    });
+    const resp = await client.postOrder(order, OrderType.FOK as any);
+    const r = resp as any;
+    logger.info(`[Client] Market SELL response: ${JSON.stringify(r)}`);
+    if (r.error) {
+      logger.warn(`[Client] placeMarketSellOrder rejected: ${r.error ?? r.errorMsg}`);
+      return null;
+    }
+    const orderId = r.orderID ?? r.order_id ?? 'unknown';
+    logger.info(`[Client] Market SELL ${amount} of token=${tokenId.slice(0, 10)}... → orderId=${orderId}`);
+    return orderId;
+  } catch (err) {
+    logger.warn(`[Client] placeMarketSellOrder failed:`, err);
+    return null;
+  }
+}
+
+export async function getTokenBalance(tokenId: string): Promise<number> {
+  try {
+    const resp = await client.getBalanceAllowance({
+      asset_type: AssetType.CONDITIONAL,
+      token_id: tokenId,
+    } as any);
+    const balance = parseFloat((resp as any).balance) || 0;
+    return balance;
+  } catch (err) {
+    logger.warn(`[Client] getTokenBalance failed for ${tokenId.slice(0, 10)}...:`, err);
+    return 0;
   }
 }

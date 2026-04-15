@@ -5,7 +5,8 @@ import {
   placeLimitOrder,
 } from './client';
 import { WsManager } from './ws-manager';
-import { ResolvedMarketConfig } from './types';
+import { PositionMonitor } from './position-monitor';
+import { ResolvedMarketConfig, TrackedOrder } from './types';
 import { roundToTick } from './utils';
 import logger from './logger';
 
@@ -14,13 +15,26 @@ export class MarketMaker {
   private refreshTimer: NodeJS.Timeout | null = null;
   private cachedMid: number | null = null;
   private isRequoting = false;
+  private paused = false;
   private shortId: string;
+  readonly positionMonitor: PositionMonitor;
 
   constructor(
     private readonly cfg: ResolvedMarketConfig,
     private readonly wsManager: WsManager
   ) {
     this.shortId = cfg.condition_id.slice(0, 10);
+    this.positionMonitor = new PositionMonitor(
+      cfg.condition_id,
+      cfg.fill_poll_interval_ms,
+      cfg.close_limit_timeout_ms,
+    );
+
+    // When a close completes, trigger a fresh requote (unless externally paused)
+    this.positionMonitor.on('closeComplete', () => {
+      logger.info(`[${this.shortId}] Close complete, triggering fresh requote`);
+      this.triggerRequote('close-complete');
+    });
   }
 
   start(): void {
@@ -46,6 +60,29 @@ export class MarketMaker {
 
   stop(): void {
     this.clearRefreshTimer();
+    this.positionMonitor.stop();
+  }
+
+  /** Pause quoting: cancel all orders, stop timers and polling. Called when another market fills. */
+  async pause(): Promise<void> {
+    if (this.paused) return;
+    this.paused = true;
+    this.clearRefreshTimer();
+    this.positionMonitor.stop();
+    await cancelMarketOrders(this.cfg.condition_id);
+    logger.info(`[${this.shortId}] Paused — orders cancelled`);
+  }
+
+  /** Resume quoting after a cross-market pause. */
+  resume(): void {
+    if (!this.paused) return;
+    this.paused = false;
+    logger.info(`[${this.shortId}] Resumed`);
+    this.triggerRequote('resume');
+  }
+
+  get conditionId(): string {
+    return this.cfg.condition_id;
   }
 
   private clearRefreshTimer(): void {
@@ -69,8 +106,16 @@ export class MarketMaker {
    * No-ops if a requote is already in flight.
    */
   private triggerRequote(reason: string): void {
+    if (this.paused) {
+      logger.debug(`[${this.shortId}] triggerRequote(${reason}): skipped, paused`);
+      return;
+    }
     if (this.isRequoting) {
       logger.debug(`[${this.shortId}] triggerRequote(${reason}): skipped, already requoting`);
+      return;
+    }
+    if (this.positionMonitor.isClosing()) {
+      logger.info(`[${this.shortId}] triggerRequote(${reason}): deferred, close in progress`);
       return;
     }
     logger.info(`[${this.shortId}] triggerRequote(${reason}): firing`);
@@ -150,7 +195,17 @@ export class MarketMaker {
         );
       }
 
-      // 8. Update last quoted mid
+      // 8. Track orders for fill detection
+      const tracked: TrackedOrder[] = [];
+      if (yesBidId && yesBidId !== 'unknown') {
+        tracked.push({ orderId: yesBidId, tokenId: this.cfg.yes_token_id, side: 'BUY', price: yesBid, size: this.cfg.min_size });
+      }
+      if (noBidId && noBidId !== 'unknown') {
+        tracked.push({ orderId: noBidId, tokenId: this.cfg.no_token_id, side: 'BUY', price: noPrice, size: this.cfg.min_size });
+      }
+      this.positionMonitor.trackOrders(tracked);
+
+      // 9. Update last quoted mid
       this.lastQuotedMid = mid;
     } finally {
       this.isRequoting = false;

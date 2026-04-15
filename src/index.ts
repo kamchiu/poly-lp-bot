@@ -44,6 +44,31 @@ async function main() {
     return { mm, cfg };
   });
 
+  // 6. Cross-market fill coordination:
+  //    When any market gets a fill, pause ALL other markets (cancel their orders)
+  //    to free up capital for closing. Resume all after close completes.
+  for (const { mm } of makers) {
+    mm.positionMonitor.on('fillDetected', (filledConditionId: string) => {
+      logger.info(`[Main] Fill detected in ${filledConditionId.slice(0, 10)}... — pausing other markets`);
+      for (const { mm: other } of makers) {
+        if (other.conditionId !== filledConditionId) {
+          other.pause().catch(err =>
+            logger.error(`[Main] Failed to pause ${other.conditionId.slice(0, 10)}...:`, err)
+          );
+        }
+      }
+    });
+
+    mm.positionMonitor.on('closeComplete', () => {
+      logger.info(`[Main] Close complete in ${mm.conditionId.slice(0, 10)}... — resuming all markets`);
+      for (const { mm: other } of makers) {
+        if (other.conditionId !== mm.conditionId) {
+          other.resume();
+        }
+      }
+    });
+  }
+
   logger.info(`[Main] Started ${makers.length} market maker(s)`);
 
   // 6. Graceful shutdown

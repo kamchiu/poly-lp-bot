@@ -10,6 +10,8 @@ export interface MarketConfig {
   spread_factor?: number;
   refresh_interval_ms?: number;
   drift_threshold_factor?: number;
+  fill_poll_interval_ms?: number;
+  close_limit_timeout_ms?: number;
 }
 
 export interface Defaults {
@@ -17,6 +19,8 @@ export interface Defaults {
   refresh_interval_ms: number;
   drift_threshold_factor: number;
   ws_host: string;
+  fill_poll_interval_ms: number;
+  close_limit_timeout_ms: number;
 }
 
 export interface AppConfig {
@@ -36,4 +40,23 @@ export interface OrderBookLevel {
 export interface OrderBook {
   bids: OrderBookLevel[];
   asks: OrderBookLevel[];
+}
+
+/** Tracked order placed by MarketMaker, used by PositionMonitor for fill detection. */
+export interface TrackedOrder {
+  orderId: string;
+  tokenId: string;
+  side: 'BUY' | 'SELL';
+  price: number;
+  size: number;
+}
+
+/** Emitted when PositionMonitor detects a (partial or full) fill. */
+export interface FillEvent {
+  orderId: string;
+  tokenId: string;
+  side: 'BUY' | 'SELL';
+  fillPrice: number;
+  sizeMatched: number;
+  originalSize: number;
 }

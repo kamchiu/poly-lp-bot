@@ -8,12 +8,20 @@ const mockGetMarketInfo = jest.fn();
 const mockGetRestMid = jest.fn();
 const mockCancelMarketOrders = jest.fn();
 const mockPlaceLimitOrder = jest.fn();
+const mockGetOrderStatus = jest.fn();
+const mockCancelOrder = jest.fn();
+const mockPlaceMarketSellOrder = jest.fn();
+const mockGetTokenBalance = jest.fn();
 
 jest.mock('../client', () => ({
   getMarketInfo: (...args: any[]) => mockGetMarketInfo(...args),
   getRestMid: (...args: any[]) => mockGetRestMid(...args),
   cancelMarketOrders: (...args: any[]) => mockCancelMarketOrders(...args),
   placeLimitOrder: (...args: any[]) => mockPlaceLimitOrder(...args),
+  getOrderStatus: (...args: any[]) => mockGetOrderStatus(...args),
+  cancelOrder: (...args: any[]) => mockCancelOrder(...args),
+  placeMarketSellOrder: (...args: any[]) => mockPlaceMarketSellOrder(...args),
+  getTokenBalance: (...args: any[]) => mockGetTokenBalance(...args),
 }));
 
 jest.mock('../logger', () => ({
@@ -38,6 +46,8 @@ function makeConfig(overrides: Partial<ResolvedMarketConfig> = {}): ResolvedMark
     refresh_interval_ms: 3_600_000, // 1h — won't fire during tests
     drift_threshold_factor: 0.15,
     ws_host: 'wss://fake.host/',
+    fill_poll_interval_ms: 3000,
+    close_limit_timeout_ms: 15000,
     ...overrides,
   };
 }
@@ -59,6 +69,7 @@ function setupHappyPath(mid = 0.50, v = 0.10, tick = 0.01) {
   mockGetRestMid.mockResolvedValue(mid);
   mockCancelMarketOrders.mockResolvedValue(undefined);
   mockPlaceLimitOrder.mockResolvedValue('order-id-123');
+  mockGetOrderStatus.mockResolvedValue(null); // no fills by default
 }
 
 // ─── startup requote ─────────────────────────────────────────────────────────
