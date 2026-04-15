@@ -14,10 +14,12 @@
   },
   "dependencies": {
     "@polymarket/clob-client": "latest",
+    "@types/node-telegram-bot-api": "^0.64.14",
     "dotenv": "^16",
     "ethers": "^5",
     "https-proxy-agent": "^9.0.0",
     "js-yaml": "^4",
+    "node-telegram-bot-api": "^0.67.0",
     "winston": "^3",
     "ws": "^8"
   },

@@ -9,9 +9,6 @@ const mockGetRestMid = jest.fn();
 const mockCancelMarketOrders = jest.fn();
 const mockPlaceLimitOrder = jest.fn();
 const mockGetOrderStatus = jest.fn();
-const mockCancelOrder = jest.fn();
-const mockPlaceMarketSellOrder = jest.fn();
-const mockGetTokenBalance = jest.fn();
 
 jest.mock('../client', () => ({
   getMarketInfo: (...args: any[]) => mockGetMarketInfo(...args),
@@ -19,14 +16,18 @@ jest.mock('../client', () => ({
   cancelMarketOrders: (...args: any[]) => mockCancelMarketOrders(...args),
   placeLimitOrder: (...args: any[]) => mockPlaceLimitOrder(...args),
   getOrderStatus: (...args: any[]) => mockGetOrderStatus(...args),
-  cancelOrder: (...args: any[]) => mockCancelOrder(...args),
-  placeMarketSellOrder: (...args: any[]) => mockPlaceMarketSellOrder(...args),
-  getTokenBalance: (...args: any[]) => mockGetTokenBalance(...args),
 }));
 
 jest.mock('../logger', () => ({
   __esModule: true,
   default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+}));
+
+jest.mock('../notifier', () => ({
+  __esModule: true,
+  notifyFill: jest.fn().mockResolvedValue(undefined),
+  notifyClosePlaced: jest.fn().mockResolvedValue(undefined),
+  notifyCloseComplete: jest.fn().mockResolvedValue(undefined),
 }));
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -47,7 +48,6 @@ function makeConfig(overrides: Partial<ResolvedMarketConfig> = {}): ResolvedMark
     drift_threshold_factor: 0.15,
     ws_host: 'wss://fake.host/',
     fill_poll_interval_ms: 3000,
-    close_limit_timeout_ms: 15000,
     ...overrides,
   };
 }

@@ -68,7 +68,6 @@ describe('resolveMarketConfig', () => {
     drift_threshold_factor: 0.15,
     ws_host: 'wss://example.com/ws/',
     fill_poll_interval_ms: 3000,
-    close_limit_timeout_ms: 15000,
   };
 
   const baseMarket: AppConfig['markets'][0] = {

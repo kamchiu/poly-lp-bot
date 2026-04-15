@@ -27,7 +27,6 @@ export class MarketMaker {
     this.positionMonitor = new PositionMonitor(
       cfg.condition_id,
       cfg.fill_poll_interval_ms,
-      cfg.close_limit_timeout_ms,
     );
 
     // When a close completes, trigger a fresh requote (unless externally paused)

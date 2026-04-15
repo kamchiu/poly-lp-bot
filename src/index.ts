@@ -4,6 +4,7 @@ import { loadConfig, resolveMarketConfig, resolveMarketIds } from './config';
 import { initClient, stopHeartbeat, cancelMarketOrders } from './client';
 import { WsManager } from './ws-manager';
 import { MarketMaker } from './market-maker';
+import { initNotifier } from './notifier';
 import logger from './logger';
 
 dotenv.config();
@@ -25,6 +26,9 @@ async function main() {
   // 2. Init REST client, derive API key, start heartbeat
   await initClient(clobHost, chainId, privateKey);
 
+  // 3. Init Telegram notifier (silent no-op if env vars not set)
+  initNotifier();
+
   // 3. Resolve market IDs from URLs (if any), then build per-market configs
   await resolveMarketIds(appConfig.markets);
   const resolvedMarkets = appConfig.markets.map(m =>
@@ -45,26 +49,22 @@ async function main() {
   });
 
   // 6. Cross-market fill coordination:
-  //    When any market gets a fill, pause ALL other markets (cancel their orders)
-  //    to free up capital for closing. Resume all after close completes.
+  //    When any market fills, pause ALL markets (including the filled one) to free
+  //    up capital for the close order. Resume all after the close completes.
   for (const { mm } of makers) {
     mm.positionMonitor.on('fillDetected', (filledConditionId: string) => {
-      logger.info(`[Main] Fill detected in ${filledConditionId.slice(0, 10)}... — pausing other markets`);
+      logger.info(`[Main] Fill in ${filledConditionId.slice(0, 10)}… — pausing ALL markets`);
       for (const { mm: other } of makers) {
-        if (other.conditionId !== filledConditionId) {
-          other.pause().catch(err =>
-            logger.error(`[Main] Failed to pause ${other.conditionId.slice(0, 10)}...:`, err)
-          );
-        }
+        other.pause().catch(err =>
+          logger.error(`[Main] Failed to pause ${other.conditionId.slice(0, 10)}…:`, err)
+        );
       }
     });
 
     mm.positionMonitor.on('closeComplete', () => {
-      logger.info(`[Main] Close complete in ${mm.conditionId.slice(0, 10)}... — resuming all markets`);
+      logger.info(`[Main] Close complete in ${mm.conditionId.slice(0, 10)}… — resuming ALL markets`);
       for (const { mm: other } of makers) {
-        if (other.conditionId !== mm.conditionId) {
-          other.resume();
-        }
+        other.resume();
       }
     });
   }

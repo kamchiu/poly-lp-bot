@@ -160,7 +160,6 @@ export function resolveMarketConfig(
     refresh_interval_ms: market.refresh_interval_ms ?? defaults.refresh_interval_ms,
     drift_threshold_factor: market.drift_threshold_factor ?? defaults.drift_threshold_factor,
     fill_poll_interval_ms: market.fill_poll_interval_ms ?? defaults.fill_poll_interval_ms,
-    close_limit_timeout_ms: market.close_limit_timeout_ms ?? defaults.close_limit_timeout_ms,
     ws_host: defaults.ws_host,
   };
 }

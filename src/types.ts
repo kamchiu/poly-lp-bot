@@ -11,7 +11,6 @@ export interface MarketConfig {
   refresh_interval_ms?: number;
   drift_threshold_factor?: number;
   fill_poll_interval_ms?: number;
-  close_limit_timeout_ms?: number;
 }
 
 export interface Defaults {
@@ -20,7 +19,6 @@ export interface Defaults {
   drift_threshold_factor: number;
   ws_host: string;
   fill_poll_interval_ms: number;
-  close_limit_timeout_ms: number;
 }
 
 export interface AppConfig {

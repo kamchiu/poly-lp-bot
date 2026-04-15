@@ -6,7 +6,6 @@ defaults:
   drift_threshold_factor: 0.4
   ws_host: wss://ws-subscriptions-clob.polymarket.com/ws/market
   fill_poll_interval_ms: 3000
-  close_limit_timeout_ms: 15000
 markets:
   - condition_id: "0x05ccbc3b7861349dc2fc0ce2c2bca9fd9671675171d7070abdf087ba1d7f085b"
     yes_token_id: "8501497159083948713316135768103773293754490207922884688769443031624417212426"
