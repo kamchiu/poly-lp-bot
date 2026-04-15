@@ -11,6 +11,7 @@ export interface MarketInfo {
 let client: ClobClient;
 let heartbeatTimer: NodeJS.Timeout;
 let lastHeartbeatId: string | null = null;
+let storedApiCreds: { key: string; secret: string; passphrase: string } | null = null;
 
 export async function initClient(host: string, chainId: number, privateKey: string): Promise<void> {
   const signer = new ethers.Wallet(privateKey);
@@ -19,6 +20,7 @@ export async function initClient(host: string, chainId: number, privateKey: stri
   // Step 1: L1-only client to derive API credentials
   const l1Client = new ClobClient(host, chainId, signer);
   const apiCreds = await l1Client.createOrDeriveApiKey();
+  storedApiCreds = { key: apiCreds.key, secret: apiCreds.secret, passphrase: apiCreds.passphrase };
   logger.info('[Client] API credentials derived');
 
   // Step 2: Full client with correct signature type
@@ -64,6 +66,12 @@ export async function initClient(host: string, chainId: number, privateKey: stri
 
 export function stopHeartbeat(): void {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
+}
+
+/** Returns the API credentials derived during initClient. Throws if called before initClient. */
+export function getApiCreds(): { key: string; secret: string; passphrase: string } {
+  if (!storedApiCreds) throw new Error('[Client] getApiCreds called before initClient');
+  return storedApiCreds;
 }
 
 export async function getMarketInfo(conditionId: string, fallbackV: number): Promise<MarketInfo> {

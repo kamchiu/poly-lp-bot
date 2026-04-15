@@ -53,11 +53,13 @@ function makeConfig(overrides: Partial<ResolvedMarketConfig> = {}): ResolvedMark
 }
 
 class FakeWsManager extends EventEmitter {}
+class FakeUserWsManager extends EventEmitter {}
 
 function makeMarketMaker(cfgOverrides: Partial<ResolvedMarketConfig> = {}) {
   const ws = new FakeWsManager();
-  const mm = new MarketMaker(makeConfig(cfgOverrides), ws as any);
-  return { mm, ws };
+  const userWs = new FakeUserWsManager();
+  const mm = new MarketMaker(makeConfig(cfgOverrides), ws as any, userWs as any);
+  return { mm, ws, userWs };
 }
 
 // setTimeout(0) schedules a macrotask; all pending microtasks (promise chains)

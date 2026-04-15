@@ -5,6 +5,7 @@ import {
   placeLimitOrder,
 } from './client';
 import { WsManager } from './ws-manager';
+import { UserWsManager } from './user-ws-manager';
 import { PositionMonitor } from './position-monitor';
 import { ResolvedMarketConfig, TrackedOrder } from './types';
 import { roundToTick } from './utils';
@@ -21,12 +22,13 @@ export class MarketMaker {
 
   constructor(
     private readonly cfg: ResolvedMarketConfig,
-    private readonly wsManager: WsManager
+    private readonly wsManager: WsManager,
+    userWsManager: UserWsManager,
   ) {
     this.shortId = cfg.condition_id.slice(0, 10);
     this.positionMonitor = new PositionMonitor(
       cfg.condition_id,
-      cfg.fill_poll_interval_ms,
+      userWsManager,
     );
 
     // When a close completes, trigger a fresh requote (unless externally paused)
@@ -62,14 +64,29 @@ export class MarketMaker {
     this.positionMonitor.stop();
   }
 
-  /** Pause quoting: cancel all orders, stop timers and polling. Called when another market fills. */
+  /**
+   * Pause quoting: cancel all LP orders, stop timers and WS tracking.
+   * Called when a *different* market fills — this market has no active close.
+   */
   async pause(): Promise<void> {
     if (this.paused) return;
     this.paused = true;
     this.clearRefreshTimer();
-    this.positionMonitor.stop();
+    this.positionMonitor.stopTracking();
     await cancelMarketOrders(this.cfg.condition_id);
     logger.info(`[${this.shortId}] Paused — orders cancelled`);
+  }
+
+  /**
+   * Pause quoting timers only — do NOT cancel orders or remove WS listeners.
+   * Called when THIS market's LP order fills, so the close order must remain
+   * active and the PositionMonitor must keep listening for the close fill.
+   */
+  pauseForClose(): void {
+    if (this.paused) return;
+    this.paused = true;
+    this.clearRefreshTimer();
+    logger.info(`[${this.shortId}] Paused for close — quoting stopped, WS listener kept`);
   }
 
   /** Resume quoting after a cross-market pause. */

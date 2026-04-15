@@ -1,8 +1,9 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 import { loadConfig, resolveMarketConfig, resolveMarketIds } from './config';
-import { initClient, stopHeartbeat, cancelMarketOrders } from './client';
+import { initClient, stopHeartbeat, cancelMarketOrders, getApiCreds } from './client';
 import { WsManager } from './ws-manager';
+import { UserWsManager } from './user-ws-manager';
 import { MarketMaker } from './market-maker';
 import { initNotifier } from './notifier';
 import logger from './logger';
@@ -41,9 +42,14 @@ async function main() {
   wsManager.subscribe(tokenIds);
   wsManager.connect();
 
+  // 4b. Init authenticated user WS (fill events)
+  const wsUserHost = appConfig.defaults.ws_host.replace(/\/ws$/, '/ws/user');
+  const userWsManager = new UserWsManager(wsUserHost, getApiCreds());
+  userWsManager.connect();
+
   // 5. Create and start a MarketMaker per market
   const makers = resolvedMarkets.map(cfg => {
-    const mm = new MarketMaker(cfg, wsManager);
+    const mm = new MarketMaker(cfg, wsManager, userWsManager);
     mm.start();
     return { mm, cfg };
   });
@@ -55,9 +61,15 @@ async function main() {
     mm.positionMonitor.on('fillDetected', (filledConditionId: string) => {
       logger.info(`[Main] Fill in ${filledConditionId.slice(0, 10)}… — pausing ALL markets`);
       for (const { mm: other } of makers) {
-        other.pause().catch(err =>
-          logger.error(`[Main] Failed to pause ${other.conditionId.slice(0, 10)}…:`, err)
-        );
+        if (other.conditionId === filledConditionId) {
+          // This market's LP order filled — keep PositionMonitor WS listener alive
+          // so it can detect the close order fill. Only stop quoting timers.
+          other.pauseForClose();
+        } else {
+          other.pause().catch(err =>
+            logger.error(`[Main] Failed to pause ${other.conditionId.slice(0, 10)}…:`, err)
+          );
+        }
       }
     });
 
@@ -85,6 +97,7 @@ async function main() {
 
     // Disconnect WS and stop heartbeat
     wsManager.disconnect();
+    userWsManager.disconnect();
     stopHeartbeat();
 
     logger.info('[Main] Shutdown complete');
