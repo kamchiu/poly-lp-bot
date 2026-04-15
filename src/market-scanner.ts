@@ -21,10 +21,10 @@ import * as yaml from 'js-yaml';
 // ---------------------------------------------------------------------------
 
 /** Minimum aggregate daily reward rate in USDC to consider a market (inclusive). */
-const MIN_DAILY_RATE = 100;
+const MIN_DAILY_RATE = 200;
 
 /** Maximum aggregate daily reward rate in USDC to consider a market (inclusive). */
-const MAX_DAILY_RATE = 300;
+const MAX_DAILY_RATE = 1500;
 
 /** Maximum rewards_min_size (shares) a market may require. */
 const MAX_MIN_SHARES = 200;
@@ -33,12 +33,12 @@ const MAX_MIN_SHARES = 200;
  * Market must expire at least this many days in the future.
  * Markets with end_date starting "2500" (perpetual) are treated as ∞ — they pass this filter.
  */
-const MIN_DAYS_TO_EXPIRY = 7;
+const MIN_DAYS_TO_EXPIRY = 3;
 
 /**
  * 24-hour volume range (USD). Too low → thin book, snipe risk. Too high → hot/volatile market.
  */
-const MIN_VOLUME_24H = 500;
+const MIN_VOLUME_24H = 1000;
 const MAX_VOLUME_24H = 200_000;
 
 /** Mid-price must stay inside [MIN_MID, MAX_MID] to avoid near-resolved markets. */
@@ -53,7 +53,7 @@ const MAX_MID = 0.90;
 const MAX_COMPETITIVENESS = 30;
 
 /** Default number of markets to write into config.yaml (overridden by --count). */
-const DEFAULT_COUNT = 5;
+const DEFAULT_COUNT = 8;
 
 // ---------------------------------------------------------------------------
 // Public CLOB REST base (no auth needed)
