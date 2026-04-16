@@ -94,6 +94,12 @@ export class UserWsManager extends EventEmitter {
         return;
       }
 
+      // Polymarket sends "PONG" as a plain string in response to "PING"
+      if (raw === 'PONG') {
+        logger.debug('[UserWS] Received PONG');
+        return;
+      }
+
       let msg: unknown;
       try {
         msg = JSON.parse(raw);
@@ -103,10 +109,6 @@ export class UserWsManager extends EventEmitter {
       }
 
       this.handleMessage(msg);
-    });
-
-    ws.on('pong', () => {
-      this.resetStaleTimer();
     });
 
     ws.on('close', (code, reason) => {
@@ -125,7 +127,8 @@ export class UserWsManager extends EventEmitter {
   private sendSubscribe(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    // Polymarket user channel: type must be 'user', no 'channel' field
+    // Polymarket user channel: type must be 'user'
+    // markets is optional — omit to receive all user events, or pass condition IDs to filter
     const msg = JSON.stringify({
       auth: {
         apiKey: this.creds.key,
@@ -133,13 +136,10 @@ export class UserWsManager extends EventEmitter {
         passphrase: this.creds.passphrase,
       },
       type: 'user',
-      markets: this.conditionIds,
-      assets_ids: this.assetIds,
+      markets: this.conditionIds.length > 0 ? this.conditionIds : undefined,
     });
     this.ws.send(msg);
-    logger.info(
-      `[UserWS] Subscribed to user channel (markets=${this.conditionIds.length}, assets=${this.assetIds.length})`
-    );
+    logger.info(`[UserWS] Subscribed to user channel (markets=${this.conditionIds.length || 'all'})`);
   }
 
   private handleMessage(msg: unknown): void {
@@ -233,7 +233,8 @@ export class UserWsManager extends EventEmitter {
     this.clearHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.ping();
+        // Polymarket requires application-level "PING" string, not WebSocket ping frame
+        this.ws.send('PING');
       }
     }, WS_HEARTBEAT_INTERVAL_MS);
   }
