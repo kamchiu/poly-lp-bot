@@ -18,6 +18,7 @@ export interface Defaults {
   refresh_interval_ms: number;
   drift_threshold_factor: number;
   ws_host: string;
+  ws_user_host: string;
   fill_poll_interval_ms: number;
 }
 

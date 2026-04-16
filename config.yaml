@@ -5,6 +5,7 @@ defaults:
   refresh_interval_ms: 70000
   drift_threshold_factor: 0.25
   ws_host: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  ws_user_host: wss://ws-subscriptions-clob.polymarket.com/ws/user
   fill_poll_interval_ms: 3000
 markets:
   - condition_id: "0x05ccbc3b7861349dc2fc0ce2c2bca9fd9671675171d7070abdf087ba1d7f085b"

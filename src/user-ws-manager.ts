@@ -76,13 +76,23 @@ export class UserWsManager extends EventEmitter {
 
     ws.on('message', (data: WebSocket.RawData) => {
       this.resetStaleTimer();
+      let raw: string;
       try {
-        const raw = data.toString();
-        const msg = JSON.parse(raw);
-        this.handleMessage(msg);
-      } catch {
-        // ignore parse errors
+        raw = data.toString();
+      } catch (err) {
+        logger.warn('[UserWS] Failed to convert message to string:', err);
+        return;
       }
+
+      let msg: unknown;
+      try {
+        msg = JSON.parse(raw);
+      } catch (err) {
+        logger.warn(`[UserWS] JSON parse error: ${(err as Error).message} — raw bytes: ${raw.slice(0, 200)}`);
+        return;
+      }
+
+      this.handleMessage(msg);
     });
 
     ws.on('pong', () => {
@@ -105,51 +115,88 @@ export class UserWsManager extends EventEmitter {
   private sendSubscribe(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    // Polymarket user channel auth — send the API credentials in the auth block
+    // Polymarket user channel: type must be 'user', no 'channel' field
     const msg = JSON.stringify({
       auth: {
         apiKey: this.creds.key,
         secret: this.creds.secret,
         passphrase: this.creds.passphrase,
       },
-      type: 'subscribe',
-      channel: 'user',
+      type: 'user',
       markets: [],
-      assets_ids: [],
     });
     this.ws.send(msg);
     logger.info('[UserWS] Subscribed to user channel');
   }
 
-  private handleMessage(msg: any): void {
-    // The user channel sends arrays of event objects:
-    // [{ event_type: "fill", order_id, market, asset_id, price, size, side, ... }, ...]
-    // It may also send other event types (order_placement, trade, etc.) — we only care about fills.
+  private handleMessage(msg: unknown): void {
+    // Server sends a single JSON object per event (not an array).
+    // Control messages: { type: 'subscribed' }, { type: 'error', ... }
+    // Trade events:    { event_type: 'trade', type: 'TRADE', maker_orders: [...], ... }
 
-    const events: any[] = Array.isArray(msg) ? msg : [msg];
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+      logger.debug(`[UserWS] Unexpected message shape: ${JSON.stringify(msg).slice(0, 200)}`);
+      return;
+    }
 
-    for (const event of events) {
-      if (!event || typeof event !== 'object') continue;
-      const type = event.event_type ?? event.type;
+    const ev = msg as Record<string, unknown>;
+    const eventType = (ev['event_type'] ?? ev['type']) as string | undefined;
 
-      if (type === 'fill') {
-        const orderId: string = event.order_id ?? '';
-        const assetId: string = event.asset_id ?? '';
-        const conditionId: string = event.market ?? '';
-        const price = parseFloat(event.price) || 0;
-        const size = parseFloat(event.size) || 0;
-        const side: string = (event.side ?? '').toUpperCase();
-        const feeRateBps = parseFloat(event.fee_rate_bps) || 0;
+    // Auth / heartbeat control messages
+    if (eventType === 'subscribed') {
+      logger.info('[UserWS] Auth confirmed — subscribed to user channel');
+      return;
+    }
+    if (eventType === 'error') {
+      const errMsg = ev['message'] ?? ev['error'] ?? JSON.stringify(ev);
+      logger.error(`[UserWS] Server returned error: ${errMsg}`);
+      this.emit('authError', errMsg);
+      return;
+    }
 
-        if (!orderId || !assetId) continue;
+    // Trade event
+    if (eventType === 'trade' || eventType === 'TRADE') {
+      this.handleTradeEvent(ev);
+      return;
+    }
 
-        logger.info(
-          `[UserWS] Fill: orderId=${orderId} assetId=${assetId.slice(0, 10)}… ` +
-          `market=${conditionId.slice(0, 10)}… ${side} size=${size} @ ${price}`
+    // Everything else (order placement, cancellation, etc.)
+    logger.debug(`[UserWS] Ignoring event_type=${String(eventType)} — ${JSON.stringify(ev).slice(0, 200)}`);
+  }
+
+  private handleTradeEvent(trade: Record<string, unknown>): void {
+    const conditionId = (trade['market'] as string) ?? '';
+    const makerOrders = trade['maker_orders'];
+
+    if (!Array.isArray(makerOrders) || makerOrders.length === 0) {
+      logger.debug(`[UserWS] Trade event has no maker_orders — ${JSON.stringify(trade).slice(0, 200)}`);
+      return;
+    }
+
+    for (const mo of makerOrders) {
+      if (!mo || typeof mo !== 'object') continue;
+      const m = mo as Record<string, unknown>;
+
+      const orderId = (m['order_id'] as string) ?? '';
+      const assetId = (m['asset_id'] as string) ?? '';
+      const price = parseFloat(m['price'] as string) || 0;
+      const size = parseFloat(m['matched_amount'] as string) || 0;
+      const side = ((m['side'] as string) ?? '').toUpperCase();
+      const feeRateBps = parseFloat(m['fee_rate_bps'] as string) || 0;
+
+      if (!orderId || !assetId) {
+        logger.warn(
+          `[UserWS] maker_order missing order_id or asset_id — dropping: ${JSON.stringify(m).slice(0, 200)}`
         );
-
-        this.emit('fill', { orderId, assetId, conditionId, price, size, side, feeRateBps });
+        continue;
       }
+
+      logger.info(
+        `[UserWS] Fill: orderId=${orderId.slice(0, 10)}… assetId=${assetId.slice(0, 10)}… ` +
+        `market=${conditionId.slice(0, 10)}… ${side} size=${size} @ ${price}`
+      );
+
+      this.emit('fill', { orderId, assetId, conditionId, price, size, side, feeRateBps });
     }
   }
 

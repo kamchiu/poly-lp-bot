@@ -14,9 +14,11 @@ import logger from './logger';
 export class MarketMaker {
   private lastQuotedMid: number | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
+  private driftDebounceTimer: NodeJS.Timeout | null = null;
   private cachedMid: number | null = null;
   private isRequoting = false;
   private paused = false;
+  private hasActiveOrders = false;
   private shortId: string;
   readonly positionMonitor: PositionMonitor;
 
@@ -61,6 +63,7 @@ export class MarketMaker {
 
   stop(): void {
     this.clearRefreshTimer();
+    this.clearDriftDebounce();
     this.positionMonitor.stop();
   }
 
@@ -72,8 +75,10 @@ export class MarketMaker {
     if (this.paused) return;
     this.paused = true;
     this.clearRefreshTimer();
+    this.clearDriftDebounce();
     this.positionMonitor.stopTracking();
     await cancelMarketOrders(this.cfg.condition_id);
+    this.hasActiveOrders = false;
     logger.info(`[${this.shortId}] Paused — orders cancelled`);
   }
 
@@ -86,6 +91,7 @@ export class MarketMaker {
     if (this.paused) return;
     this.paused = true;
     this.clearRefreshTimer();
+    this.clearDriftDebounce();
     logger.info(`[${this.shortId}] Paused for close — quoting stopped, WS listener kept`);
   }
 
@@ -105,6 +111,13 @@ export class MarketMaker {
     if (this.refreshTimer) {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = null;
+    }
+  }
+
+  private clearDriftDebounce(): void {
+    if (this.driftDebounceTimer) {
+      clearTimeout(this.driftDebounceTimer);
+      this.driftDebounceTimer = null;
     }
   }
 
@@ -142,20 +155,43 @@ export class MarketMaker {
   }
 
   private onMidUpdate(newMid: number): void {
-    // First update ever: requote immediately
+    // First update ever: requote immediately (no orders to cancel yet)
     if (this.lastQuotedMid === null) {
       logger.info(`[${this.shortId}] onMidUpdate: first mid=${newMid.toFixed(4)}, triggering requote`);
       this.triggerRequote('first-mid');
       return;
     }
 
-    // Drift check: requote if price moved beyond threshold
+    // Drift check
     const drift = Math.abs(newMid - this.lastQuotedMid);
     const threshold = this.cfg.fallback_v * this.cfg.drift_threshold_factor;
-    if (drift > threshold) {
-      logger.info(`[${this.shortId}] onMidUpdate: drift=${drift.toFixed(4)} > threshold=${threshold.toFixed(4)}, triggering requote`);
-      this.triggerRequote('drift');
+    if (drift <= threshold) return;
+
+    // Price has drifted — cancel orders immediately (once), then debounce the requote
+    if (this.hasActiveOrders) {
+      logger.info(
+        `[${this.shortId}] onMidUpdate: drift=${drift.toFixed(4)} > threshold=${threshold.toFixed(4)}, ` +
+        `cancelling orders, debouncing requote`
+      );
+      this.hasActiveOrders = false;
+      this.positionMonitor.stopTracking();
+      cancelMarketOrders(this.cfg.condition_id).catch(err =>
+        logger.error(`[${this.shortId}] cancelMarketOrders (drift) error:`, err)
+      );
+    } else {
+      logger.debug(
+        `[${this.shortId}] onMidUpdate: drift=${drift.toFixed(4)} > threshold=${threshold.toFixed(4)}, ` +
+        `resetting debounce (no active orders)`
+      );
     }
+
+    // Reset debounce timer — requote fires 3s after the last drift event
+    this.clearDriftDebounce();
+    this.clearRefreshTimer();
+    this.driftDebounceTimer = setTimeout(() => {
+      this.driftDebounceTimer = null;
+      this.triggerRequote('drift');
+    }, 3000);
   }
 
   private async requote(reason: string): Promise<void> {
@@ -197,6 +233,7 @@ export class MarketMaker {
 
       // 6. Cancel existing orders
       await cancelMarketOrders(this.cfg.condition_id);
+      this.hasActiveOrders = false;
 
       // 7. Place new orders: BUY YES + BUY NO (both use USDC as collateral)
       const [yesBidId, noBidId] = await Promise.all([
@@ -220,6 +257,7 @@ export class MarketMaker {
         tracked.push({ orderId: noBidId, tokenId: this.cfg.no_token_id, side: 'BUY', price: noPrice, size: this.cfg.min_size });
       }
       this.positionMonitor.trackOrders(tracked);
+      this.hasActiveOrders = tracked.length > 0;
 
       // 9. Update last quoted mid
       this.lastQuotedMid = mid;

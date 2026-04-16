@@ -43,8 +43,7 @@ async function main() {
   wsManager.connect();
 
   // 4b. Init authenticated user WS (fill events)
-  const wsUserHost = appConfig.defaults.ws_host.replace(/\/ws$/, '/ws/user');
-  const userWsManager = new UserWsManager(wsUserHost, getApiCreds());
+  const userWsManager = new UserWsManager(appConfig.defaults.ws_user_host, getApiCreds());
   userWsManager.connect();
 
   // 5. Create and start a MarketMaker per market
