@@ -33,7 +33,7 @@ const MAX_MIN_SHARES = 50;
  * Market must expire at least this many days in the future.
  * Markets with end_date starting "2500" (perpetual) are treated as ∞ — they pass this filter.
  */
-const MIN_DAYS_TO_EXPIRY = 5;
+const MIN_DAYS_TO_EXPIRY = 3;
 
 /**
  * 24-hour volume range (USD). Too low → thin book, snipe risk. Too high → hot/volatile market.
@@ -51,6 +51,9 @@ const MAX_MID = 0.8;
  * ≤30 ≈ 1–2 bars (low competition). Raise if you want to include busier markets.
  */
 const MAX_COMPETITIVENESS = 30;
+
+/** Default number of markets to write into config.yaml (overridden by --count). */
+const DEFAULT_COUNT = 30;
 
 // ---------------------------------------------------------------------------
 // Public CLOB REST base (no auth needed)
