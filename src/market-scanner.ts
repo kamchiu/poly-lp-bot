@@ -52,9 +52,6 @@ const MAX_MID = 0.8;
  */
 const MAX_COMPETITIVENESS = 30;
 
-/** Default number of markets to write into config.yaml (overridden by --count). */
-const DEFAULT_COUNT = 30;
-
 // ---------------------------------------------------------------------------
 // Public CLOB REST base (no auth needed)
 // ---------------------------------------------------------------------------
@@ -120,6 +117,7 @@ interface MarketReward {
   tokens: MarketToken[];       // always populated in /multi endpoint
   volume_24hr: number;
   end_date?: string;           // e.g. "2025-12-31 12:00:00+00"
+  spread?: number;             // current orderbook ask−bid (decimal, e.g. 0.01)
 }
 
 interface PaginationPayload {
@@ -182,6 +180,11 @@ function scoreMarket(
 
   // --- Filter: competitiveness ---
   if (reward.market_competitiveness > MAX_COMPETITIVENESS) return null;
+
+  // --- Filter: current spread must be within the rewards band ---
+  if (reward.spread !== undefined) {
+    if (reward.spread > reward.rewards_max_spread / 100) return null;
+  }
 
   // --- Filter: expiry ---
   const endDateStr = reward.end_date ?? reward.rewards_config?.[0]?.end_date;
@@ -295,7 +298,7 @@ async function main() {
     `Filters: daily_rate=${MIN_DAILY_RATE}–${MAX_DAILY_RATE} USDC/day | ` +
     `min_size≤${MAX_MIN_SHARES} | expiry≥${MIN_DAYS_TO_EXPIRY}d | ` +
     `vol_24h=${MIN_VOLUME_24H.toLocaleString()}–${MAX_VOLUME_24H.toLocaleString()} | ` +
-    `competitiveness≤${MAX_COMPETITIVENESS}`
+    `competitiveness≤${MAX_COMPETITIVENESS} | spread≤rewards_max_spread`
   );
   console.log(`Target: top ${count} market(s)\n`);
 
