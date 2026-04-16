@@ -43,7 +43,11 @@ async function main() {
   wsManager.connect();
 
   // 4b. Init authenticated user WS (fill events)
-  const userWsManager = new UserWsManager(appConfig.defaults.ws_user_host, getApiCreds());
+  const userWsManager = new UserWsManager(appConfig.defaults.ws_user_host, getApiCreds(), {
+    // Subscribe only to markets/assets we actively quote.
+    assetIds: tokenIds,
+    conditionIds: resolvedMarkets.map(m => m.condition_id),
+  });
   userWsManager.connect();
 
   // 5. Create and start a MarketMaker per market

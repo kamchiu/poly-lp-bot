@@ -30,12 +30,22 @@ export class UserWsManager extends EventEmitter {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private staleTimer: NodeJS.Timeout | null = null;
   private stopping = false;
+  private readonly assetIds: string[];
+  private readonly conditionIds: string[];
 
   constructor(
     private readonly wsHost: string,
     private readonly creds: UserWsCreds,
+    subscription?: {
+      /** Asset token IDs we want trade/maker fills for (e.g. YES+NO tokens). */
+      assetIds?: string[];
+      /** CLOB condition IDs (markets) we want trade/maker fills for. */
+      conditionIds?: string[];
+    }
   ) {
     super();
+    this.assetIds = subscription?.assetIds ?? [];
+    this.conditionIds = subscription?.conditionIds ?? [];
   }
 
   connect(): void {
@@ -123,10 +133,13 @@ export class UserWsManager extends EventEmitter {
         passphrase: this.creds.passphrase,
       },
       type: 'user',
-      markets: [],
+      markets: this.conditionIds,
+      assets_ids: this.assetIds,
     });
     this.ws.send(msg);
-    logger.info('[UserWS] Subscribed to user channel');
+    logger.info(
+      `[UserWS] Subscribed to user channel (markets=${this.conditionIds.length}, assets=${this.assetIds.length})`
+    );
   }
 
   private handleMessage(msg: unknown): void {
@@ -141,6 +154,13 @@ export class UserWsManager extends EventEmitter {
 
     const ev = msg as Record<string, unknown>;
     const eventType = (ev['event_type'] ?? ev['type']) as string | undefined;
+
+    // Some payloads may omit/rename event_type but still include maker_orders.
+    // We prefer structural detection to avoid missing fills.
+    if (Array.isArray(ev['maker_orders'])) {
+      this.handleTradeEvent(ev);
+      return;
+    }
 
     // Auth / heartbeat control messages
     if (eventType === 'subscribed') {
