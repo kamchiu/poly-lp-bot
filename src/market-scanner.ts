@@ -30,10 +30,11 @@ const MAX_DAILY_RATE = 1500;
 const MAX_MIN_SHARES = 50;
 
 /**
- * Market must expire at least this many days in the future.
- * Markets with end_date starting "2500" (perpetual) are treated as ∞ — they pass this filter.
+ * Rewards start_date filter. Set to -1 to use today's date (UTC).
+ * Only markets whose rewards_config start_date is AFTER this date pass.
+ * Format: "YYYY-MM-DD" or -1.
  */
-const MIN_DAYS_TO_EXPIRY = 3;
+const MIN_START_DATE: string | -1 = -1;
 
 /**
  * 24-hour volume range (USD). Too low → thin book, snipe risk. Too high → hot/volatile market.
@@ -59,9 +60,6 @@ const DEFAULT_COUNT = 30;
 // Public CLOB REST base (no auth needed)
 // ---------------------------------------------------------------------------
 const CLOB_HOST = 'https://clob.polymarket.com';
-
-// "perpetual" sentinel: Polymarket uses year 2500 for markets without a fixed expiry
-const PERPETUAL_YEAR = '2500';
 
 // ---------------------------------------------------------------------------
 // Proxy support (mirrors config.ts)
@@ -157,7 +155,6 @@ async function fetchAllMultiRewards(): Promise<MarketReward[]> {
 interface ScoredMarket {
   reward: MarketReward;   // representative condition_id for this token
   mid: number;
-  daysToExpiry: number;   // Infinity for perpetual markets
   dailyRate: number;      // aggregate rate across all sponsors for this token
   competitiveness: number;
   score: number;
@@ -172,7 +169,7 @@ interface ScoredMarket {
  */
 function scoreMarket(
   reward: MarketReward,
-  now: Date,
+  thresholdDate: Date,
   aggregateDailyRate: number
 ): ScoredMarket | null {
   // --- Filter: aggregate daily rate range ---
@@ -189,15 +186,11 @@ function scoreMarket(
     if (reward.spread > reward.rewards_max_spread / 100) return null;
   }
 
-  // --- Filter: expiry ---
-  const endDateStr = reward.end_date ?? reward.rewards_config?.[0]?.end_date;
-  const isPerpetual = !endDateStr || endDateStr.startsWith(PERPETUAL_YEAR);
-  let daysToExpiry: number;
-  if (isPerpetual) {
-    daysToExpiry = Infinity;
-  } else {
-    daysToExpiry = (new Date(endDateStr!).getTime() - now.getTime()) / (1000 * 60 * 60 * 24);
-    if (daysToExpiry < MIN_DAYS_TO_EXPIRY) return null;
+  // --- Filter: start_date must be after the configured threshold date ---
+  const startDateStr = reward.rewards_config?.[0]?.start_date;
+  if (startDateStr) {
+    const startDate = new Date(startDateStr);
+    if (!isNaN(startDate.getTime()) && startDate <= thresholdDate) return null;
   }
 
   // --- Filter: 24h volume ---
@@ -215,18 +208,13 @@ function scoreMarket(
   const mid = yesToken.price;
   if (mid < MIN_MID || mid > MAX_MID) return null;
 
-  // --- Score: higher aggregate rate × lower competitiveness × more time = better ---
-  // Normalise competitiveness against MAX_COMPETITIVENESS so competition factor ∈ [0,1]
+  // --- Score: higher aggregate rate × lower competitiveness = better ---
   const competition = Math.min(reward.market_competitiveness / MAX_COMPETITIVENESS, 1.0);
-  // time_bonus caps at 2.0 for markets ≥ 60 days out; perpetual = max bonus
-  const effectiveDays = isFinite(daysToExpiry) ? daysToExpiry : 60;
-  const timebonus = Math.min(effectiveDays / 30, 2.0);
-  const score = aggregateDailyRate * (1 - competition) * timebonus;
+  const score = aggregateDailyRate * (1 - competition);
 
   return {
     reward,
     mid,
-    daysToExpiry,
     dailyRate: aggregateDailyRate,
     competitiveness: reward.market_competitiveness,
     score,
@@ -296,10 +284,25 @@ async function main() {
   const countIdx = args.indexOf('--count');
   const count = countIdx !== -1 ? parseInt(args[countIdx + 1], 10) : DEFAULT_COUNT;
 
+  // Resolve threshold date: CLI --start-date overrides constant; -1 → today UTC
+  const startDateIdx = args.indexOf('--start-date');
+  const startDateArg = startDateIdx !== -1 ? args[startDateIdx + 1] : MIN_START_DATE;
+  let thresholdDate: Date;
+  if (startDateArg === -1 || startDateArg === '-1') {
+    const t = new Date();
+    thresholdDate = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate()));
+  } else {
+    thresholdDate = new Date(startDateArg as string);
+    if (isNaN(thresholdDate.getTime())) {
+      console.error(`Invalid --start-date value: ${startDateArg}`);
+      process.exit(1);
+    }
+  }
+
   console.log('=== Polymarket LP Market Scanner ===');
   console.log(
     `Filters: daily_rate=${MIN_DAILY_RATE}–${MAX_DAILY_RATE} USDC/day | ` +
-    `min_size≤${MAX_MIN_SHARES} | expiry≥${MIN_DAYS_TO_EXPIRY}d | ` +
+    `min_size≤${MAX_MIN_SHARES} | start_date>${thresholdDate.toISOString().slice(0, 10)} | ` +
     `vol_24h=${MIN_VOLUME_24H.toLocaleString()}–${MAX_VOLUME_24H.toLocaleString()} | ` +
     `competitiveness≤${MAX_COMPETITIVENESS} | spread≤rewards_max_spread`
   );
@@ -309,8 +312,6 @@ async function main() {
   process.stdout.write('Fetching rewards markets from CLOB...');
   const allRewards = await fetchAllMultiRewards();
   console.log(` ${allRewards.length} total`);
-
-  const now = new Date();
 
   // 2. Cheap pre-filter: min_size only.
   //    Do NOT filter by rate yet — the same underlying market can have multiple
@@ -361,10 +362,10 @@ async function main() {
   }
   console.log(`Unique underlying tokens: ${tokenGroups.size}`);
 
-  // 5. Score all groups — all filters applied here (rate, competitiveness, expiry, volume, mid).
+  // 5. Score all groups — all filters applied here (rate, competitiveness, start_date, volume, mid).
   const scored: ScoredMarket[] = [];
   for (const { representative: entry, totalRate } of tokenGroups.values()) {
-    const result = scoreMarket(entry.reward, now, totalRate);
+    const result = scoreMarket(entry.reward, thresholdDate, totalRate);
     if (result !== null) scored.push(result);
   }
   console.log(`After all filters: ${scored.length} market(s) pass`);
@@ -380,16 +381,16 @@ async function main() {
 
   // 7. Print summary table
   console.log('\nSelected markets:');
-  console.log('  #  Score   Rate/day  Compet   DaysLeft  Mid    Question');
-  console.log('  -- ------  --------  -------  --------  -----  --------');
+  console.log('  #  Score   Rate/day  Compet   StartDate   Mid    Question');
+  console.log('  -- ------  --------  -------  ----------  -----  --------');
   for (let i = 0; i < selected.length; i++) {
     const s = selected[i];
-    const days = isFinite(s.daysToExpiry) ? s.daysToExpiry.toFixed(0) : '∞';
+    const startDate = s.reward.rewards_config?.[0]?.start_date?.slice(0, 10) ?? 'unknown';
     const question = (s.reward.question ?? '').slice(0, 55);
     console.log(
       `  ${String(i + 1).padStart(2)}  ${s.score.toFixed(1).padStart(6)}  ` +
       `$${s.dailyRate.toFixed(0).padStart(7)}  ${s.competitiveness.toFixed(1).padStart(7)}  ` +
-      `${String(days).padStart(8)}  ${s.mid.toFixed(2)}   ${question}`
+      `${startDate}  ${s.mid.toFixed(2)}   ${question}`
     );
   }
 
