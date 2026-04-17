@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { placeLimitOrder } from './client';
+import { placeLimitOrder, getTokenBalance } from './client';
 import { notifyFill, notifyClosePlaced, notifyCloseComplete } from './notifier';
 import { UserWsManager } from './user-ws-manager';
 import { TrackedOrder } from './types';
@@ -95,8 +95,18 @@ export class PositionMonitor extends EventEmitter {
   }
 
   private handleFill(event: WsFillEvent): void {
+    logger.debug(
+      `[${this.shortId}] handleFill: orderId=${event.orderId.slice(0, 10)}… ` +
+      `eventConditionId=${event.conditionId?.slice(0, 10) || 'null'}… ` +
+      `thisConditionId=${this.conditionId.slice(0, 10)}… ` +
+      `watched=${this.watchedOrderIds.has(event.orderId)} closing=${!!this.closing}`
+    );
+
     // Filter to fills in our market (conditionId match)
-    if (event.conditionId && event.conditionId !== this.conditionId) return;
+    if (event.conditionId && event.conditionId !== this.conditionId) {
+      logger.debug(`[${this.shortId}] Skipping fill: conditionId mismatch`);
+      return;
+    }
 
     // Case 1: fill on one of our tracked LP (buy) orders — exact orderId match
     if (this.watchedOrderIds.has(event.orderId) && !this.closing) {
@@ -168,6 +178,28 @@ export class PositionMonitor extends EventEmitter {
       `[${this.shortId}] Closing position: SELL ${size} token=${tokenId.slice(0, 10)}… ` +
       `fillPrice=${fillPrice} closePrice=${closePrice} (+${(CLOSE_PRICE_MARKUP * 100).toFixed(0)}%)`
     );
+
+    // Wait for token balance to arrive (settlement delay after fill)
+    const maxWaitMs = 30000; // 30s timeout
+    const pollIntervalMs = 1000; // check every 1s
+    const startTime = Date.now();
+    let balance = 0;
+
+    while (Date.now() - startTime < maxWaitMs) {
+      balance = await getTokenBalance(tokenId);
+      if (balance >= size) {
+        logger.info(`[${this.shortId}] Token balance confirmed: ${balance} >= ${size}`);
+        break;
+      }
+      logger.debug(`[${this.shortId}] Waiting for balance: ${balance}/${size} (${Math.floor((Date.now() - startTime) / 1000)}s)`);
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+
+    if (balance < size) {
+      logger.warn(`[${this.shortId}] Balance timeout: ${balance}/${size} after ${maxWaitMs}ms — abandoning position`);
+      this.finishClose('balance-timeout');
+      return;
+    }
 
     const closeOrderId = await placeLimitOrder('SELL', closePrice, size, tokenId);
 

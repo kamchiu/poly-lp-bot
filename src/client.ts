@@ -197,3 +197,16 @@ export async function cancelOrder(orderId: string): Promise<void> {
     logger.warn(`[Client] cancelOrder failed for ${orderId}:`, err);
   }
 }
+
+export async function getTokenBalance(tokenId: string): Promise<number> {
+  try {
+    await client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: tokenId });
+    const bal = await client.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: tokenId }) as any;
+    const balance = parseFloat(bal.balance) || 0;
+    logger.debug(`[Client] Token balance for ${tokenId.slice(0, 10)}...: ${balance}`);
+    return balance;
+  } catch (err) {
+    logger.warn(`[Client] getTokenBalance failed for ${tokenId}:`, err);
+    return 0;
+  }
+}
