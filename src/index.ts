@@ -90,12 +90,14 @@ async function main() {
   // 5. Create and start a MarketMaker per market
   const makers = resolvedMarkets.map(cfg => {
     const mm = new MarketMaker(cfg, wsManager, userWsManager);
+    mm.start();
     return { mm, cfg };
   });
 
-  let started = false;
+  let started = true;
   let riskPaused = false;
   let shuttingDown = false;
+  let userWsAuthenticated = false;
 
   async function pauseAllForRisk(reason: string): Promise<void> {
     if (shuttingDown || riskPaused) return;
@@ -108,10 +110,9 @@ async function main() {
   }
 
   userWsManager.on('connected', () => {
-    if (!started) {
-      started = true;
-      logger.info('[Main] User WS authenticated — starting market makers');
-      makers.forEach(({ mm }) => mm.start());
+    if (!userWsAuthenticated) {
+      userWsAuthenticated = true;
+      logger.info('[Main] User WS authenticated');
       return;
     }
 
@@ -124,6 +125,7 @@ async function main() {
   });
 
   userWsManager.on('disconnected', () => {
+    userWsAuthenticated = false;
     if (started) {
       pauseAllForRisk('user-ws-disconnected').catch(err =>
         logger.error('[Main] Failed to enter risk pause after user WS disconnect:', err)
