@@ -4,7 +4,14 @@ import { OrderBook, OrderBookLevel } from './types';
  * Round price to nearest tick size.
  */
 export function roundToTick(price: number, tickSize: number): number {
-  return Math.round(price / tickSize) * tickSize;
+  return normalizeTick(Math.round((price / tickSize) + 1e-9) * tickSize);
+}
+
+/**
+ * Round price down to the nearest tick size.
+ */
+export function roundDownToTick(price: number, tickSize: number): number {
+  return normalizeTick(Math.floor((price / tickSize) + 1e-9) * tickSize);
 }
 
 /**
@@ -55,4 +62,8 @@ function mergeLevels(existing: OrderBookLevel[], updates: OrderBookLevel[]): Ord
     }
   }
   return Array.from(map.entries()).map(([price, size]) => ({ price, size }));
+}
+
+function normalizeTick(price: number): number {
+  return parseFloat(price.toFixed(10));
 }

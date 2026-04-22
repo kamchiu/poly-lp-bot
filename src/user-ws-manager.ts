@@ -30,6 +30,7 @@ export class UserWsManager extends EventEmitter {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private staleTimer: NodeJS.Timeout | null = null;
   private stopping = false;
+  private authenticated = false;
   private readonly assetIds: string[];
   private readonly conditionIds: string[];
 
@@ -60,6 +61,7 @@ export class UserWsManager extends EventEmitter {
       this.ws.terminate();
       this.ws = null;
     }
+    this.authenticated = false;
     logger.info('[UserWS] Disconnected');
   }
 
@@ -78,10 +80,10 @@ export class UserWsManager extends EventEmitter {
     ws.on('open', () => {
       logger.info('[UserWS] Connected');
       this.reconnectAttempt = 0;
+      this.authenticated = false;
       this.resetStaleTimer();
       this.startHeartbeat();
       this.sendSubscribe();
-      this.emit('connected');
     });
 
     ws.on('message', (data: WebSocket.RawData) => {
@@ -114,6 +116,7 @@ export class UserWsManager extends EventEmitter {
     ws.on('close', (code, reason) => {
       logger.warn(`[UserWS] Closed code=${code} reason=${reason.toString()}`);
       this.clearTimers();
+      this.authenticated = false;
       this.emit('disconnected');
       if (!this.stopping) this.scheduleReconnect();
     });
@@ -139,7 +142,7 @@ export class UserWsManager extends EventEmitter {
       markets: this.conditionIds.length > 0 ? this.conditionIds : undefined,
     });
     this.ws.send(msg);
-    logger.info(`[UserWS] Subscribed to user channel (markets=${this.conditionIds.length || 'all'})`);
+    logger.info(`[UserWS] Subscribe request sent (markets=${this.conditionIds.length || 'all'})`);
   }
 
   private handleMessage(msg: unknown): void {
@@ -165,11 +168,14 @@ export class UserWsManager extends EventEmitter {
     // Auth / heartbeat control messages
     if (eventType === 'subscribed') {
       logger.info('[UserWS] Auth confirmed — subscribed to user channel');
+      this.authenticated = true;
+      this.emit('connected');
       return;
     }
     if (eventType === 'error') {
       const errMsg = ev['message'] ?? ev['error'] ?? JSON.stringify(ev);
       logger.error(`[UserWS] Server returned error: ${errMsg}`);
+      this.authenticated = false;
       this.emit('authError', errMsg);
       return;
     }
@@ -203,6 +209,20 @@ export class UserWsManager extends EventEmitter {
       const size = parseFloat(m['matched_amount'] as string) || 0;
       const side = ((m['side'] as string) ?? '').toUpperCase();
       const feeRateBps = parseFloat(m['fee_rate_bps'] as string) || 0;
+      const eventKey = [
+        String(trade['id'] ?? ''),
+        String(trade['transaction_hash'] ?? trade['tx_hash'] ?? ''),
+        String(trade['timestamp'] ?? trade['match_time'] ?? ''),
+        String(m['id'] ?? m['trade_id'] ?? ''),
+        String(m['transaction_hash'] ?? m['tx_hash'] ?? ''),
+        String(m['match_time'] ?? m['timestamp'] ?? ''),
+        conditionId,
+        orderId,
+        assetId,
+        side,
+        String(m['price'] ?? ''),
+        String(m['matched_amount'] ?? ''),
+      ].join('|');
 
       if (!orderId || !assetId) {
         logger.warn(
@@ -216,7 +236,7 @@ export class UserWsManager extends EventEmitter {
         `market=${conditionId.slice(0, 10)}… ${side} size=${size} @ ${price}`
       );
 
-      this.emit('fill', { orderId, assetId, conditionId, price, size, side, feeRateBps });
+      this.emit('fill', { orderId, assetId, conditionId, price, size, side, feeRateBps, eventKey });
     }
   }
 

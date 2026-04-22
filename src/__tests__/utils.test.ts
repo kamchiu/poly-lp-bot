@@ -1,4 +1,4 @@
-import { roundToTick, calcMidpoint, applyBookDelta } from '../utils';
+import { roundToTick, roundDownToTick, calcMidpoint, applyBookDelta } from '../utils';
 import { OrderBook } from '../types';
 
 // ─── roundToTick ────────────────────────────────────────────────────────────
@@ -29,6 +29,20 @@ describe('roundToTick', () => {
 
   it('returns 0 when price is 0', () => {
     expect(roundToTick(0, 0.01)).toBe(0);
+  });
+});
+
+describe('roundDownToTick', () => {
+  it('keeps an aligned price unchanged', () => {
+    expect(roundDownToTick(0.55, 0.01)).toBeCloseTo(0.55);
+  });
+
+  it('rounds a buy price down instead of to the nearest tick', () => {
+    expect(roundDownToTick(0.556, 0.01)).toBeCloseTo(0.55);
+  });
+
+  it('handles floating-point tick math safely', () => {
+    expect(roundDownToTick(0.3, 0.1)).toBeCloseTo(0.3);
   });
 });
 

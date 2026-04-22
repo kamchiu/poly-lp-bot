@@ -31,7 +31,8 @@ async function send(text: string): Promise<void> {
   try {
     await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
   } catch (err) {
-    logger.warn('[Notifier] Failed to send Telegram message:', err);
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Notifier] Failed to send Telegram message: ${message}`);
   }
 }
 
@@ -82,6 +83,18 @@ export async function notifyCloseComplete(params: {
   const short = params.conditionId.slice(0, 10);
   const msg =
     `✅ <b>Position closed</b>\n` +
+    `Market: <code>${short}…</code>\n` +
+    `Reason: ${params.reason}`;
+  await send(msg);
+}
+
+export async function notifyCloseFailed(params: {
+  conditionId: string;
+  reason: string;
+}): Promise<void> {
+  const short = params.conditionId.slice(0, 10);
+  const msg =
+    `🛑 <b>Risk lock</b>\n` +
     `Market: <code>${short}…</code>\n` +
     `Reason: ${params.reason}`;
   await send(msg);

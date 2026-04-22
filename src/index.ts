@@ -1,7 +1,7 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 import { loadConfig, resolveMarketConfig, resolveMarketIds } from './config';
-import { initClient, stopHeartbeat, cancelMarketOrders, getApiCreds } from './client';
+import { initClient, stopHeartbeat, cancelMarketOrders, getApiCreds, getOpenOrders, getTokenBalanceStrict } from './client';
 import { WsManager } from './ws-manager';
 import { UserWsManager } from './user-ws-manager';
 import { MarketMaker } from './market-maker';
@@ -9,6 +9,8 @@ import { initNotifier } from './notifier';
 import logger from './logger';
 
 dotenv.config();
+
+const STARTUP_INVENTORY_EPSILON = 1e-6;
 
 async function main() {
   // 1. Load configuration
@@ -36,6 +38,42 @@ async function main() {
     resolveMarketConfig(m, appConfig.defaults)
   );
 
+  for (const cfg of resolvedMarkets) {
+    const shortId = cfg.condition_id.slice(0, 10);
+    const openOrders = await getOpenOrders(cfg.condition_id);
+
+    if (openOrders.length > 0) {
+      logger.warn(
+        `[Main] Startup reconcile: found ${openOrders.length} open order(s) in ${shortId}…, cancelling before start`
+      );
+
+      const cancelled = await cancelMarketOrders(cfg.condition_id);
+      if (!cancelled) {
+        throw new Error(`[Main] Startup reconcile failed for ${shortId}…: stale-order-cancel-failed`);
+      }
+
+      const remainingOrders = await getOpenOrders(cfg.condition_id);
+      if (remainingOrders.length > 0) {
+        throw new Error(
+          `[Main] Startup reconcile failed for ${shortId}…: ${remainingOrders.length} open order(s) remain after cancel`
+        );
+      }
+    }
+
+    const [yesBalance, noBalance] = await Promise.all([
+      getTokenBalanceStrict(cfg.yes_token_id),
+      getTokenBalanceStrict(cfg.no_token_id),
+    ]);
+
+    if (yesBalance > STARTUP_INVENTORY_EPSILON || noBalance > STARTUP_INVENTORY_EPSILON) {
+      throw new Error(
+        `[Main] Startup reconcile failed for ${shortId}…: residual inventory yes=${yesBalance} no=${noBalance}`
+      );
+    }
+  }
+
+  logger.info('[Main] Startup reconcile passed');
+
   // 4. Init WS manager and subscribe to all token IDs (YES + NO)
   const wsManager = new WsManager(appConfig.defaults.ws_host);
   const tokenIds = resolvedMarkets.flatMap(m => [m.yes_token_id, m.no_token_id]);
@@ -48,14 +86,58 @@ async function main() {
     assetIds: tokenIds,
     conditionIds: resolvedMarkets.map(m => m.condition_id),
   });
-  userWsManager.connect();
 
   // 5. Create and start a MarketMaker per market
   const makers = resolvedMarkets.map(cfg => {
     const mm = new MarketMaker(cfg, wsManager, userWsManager);
-    mm.start();
     return { mm, cfg };
   });
+
+  let started = false;
+  let riskPaused = false;
+  let shuttingDown = false;
+
+  async function pauseAllForRisk(reason: string): Promise<void> {
+    if (shuttingDown || riskPaused) return;
+    riskPaused = true;
+
+    logger.error(`[Main] Entering risk pause: ${reason}`);
+    await Promise.allSettled(
+      makers.map(({ mm }) => mm.pauseForRisk(reason))
+    );
+  }
+
+  userWsManager.on('connected', () => {
+    if (!started) {
+      started = true;
+      logger.info('[Main] User WS authenticated — starting market makers');
+      makers.forEach(({ mm }) => mm.start());
+      return;
+    }
+
+    if (riskPaused) {
+      logger.warn('[Main] User WS reconnected during risk pause — manual intervention required');
+      return;
+    }
+
+    logger.info('[Main] User WS reconnected');
+  });
+
+  userWsManager.on('disconnected', () => {
+    if (started) {
+      pauseAllForRisk('user-ws-disconnected').catch(err =>
+        logger.error('[Main] Failed to enter risk pause after user WS disconnect:', err)
+      );
+    }
+  });
+
+  userWsManager.on('authError', (err) => {
+    pauseAllForRisk(`user-ws-auth-error: ${String(err)}`).catch(error =>
+      logger.error('[Main] Failed to enter risk pause after user WS auth error:', error)
+    );
+  });
+
+  userWsManager.connect();
 
   // 6. Cross-market fill coordination:
   //    When any market fills, pause ALL markets (including the filled one) to free
@@ -63,24 +145,52 @@ async function main() {
   for (const { mm } of makers) {
     mm.positionMonitor.on('fillDetected', (filledConditionId: string) => {
       logger.info(`[Main] Fill in ${filledConditionId.slice(0, 10)}… — pausing ALL markets`);
+      const pausePromises: Array<Promise<boolean>> = [];
       for (const { mm: other } of makers) {
         if (other.conditionId === filledConditionId) {
           // This market's LP order filled — keep PositionMonitor WS listener alive
           // so it can detect the close order fill. Only stop quoting timers.
           other.pauseForClose();
         } else {
-          other.pause().catch(err =>
-            logger.error(`[Main] Failed to pause ${other.conditionId.slice(0, 10)}…:`, err)
-          );
+          pausePromises.push(other.pause());
         }
       }
+
+      if (pausePromises.length === 0) return;
+
+      Promise.allSettled(pausePromises)
+        .then(results => {
+          const pauseFailed = results.some(result =>
+            result.status === 'rejected' || !result.value
+          );
+
+          if (!pauseFailed) return;
+
+          return pauseAllForRisk(`cross-market-pause-failed:${filledConditionId.slice(0, 10)}`);
+        })
+        .catch(err =>
+          logger.error(
+            `[Main] Failed while pausing peer markets after fill in ${filledConditionId.slice(0, 10)}…:`,
+            err
+          )
+        );
     });
 
     mm.positionMonitor.on('closeComplete', () => {
+      if (riskPaused) {
+        logger.warn(`[Main] Close complete in ${mm.conditionId.slice(0, 10)}… but risk pause is active`);
+        return;
+      }
       logger.info(`[Main] Close complete in ${mm.conditionId.slice(0, 10)}… — resuming ALL markets`);
       for (const { mm: other } of makers) {
         other.resume();
       }
+    });
+
+    mm.positionMonitor.on('closeFailed', (reason: string) => {
+      pauseAllForRisk(`close-failed:${mm.conditionId.slice(0, 10)}:${reason}`).catch(err =>
+        logger.error(`[Main] Failed to enter risk pause after close failure in ${mm.conditionId.slice(0, 10)}…:`, err)
+      );
     });
   }
 
@@ -89,22 +199,38 @@ async function main() {
   // 6. Graceful shutdown
   async function shutdown(signal: string) {
     logger.info(`[Main] Received ${signal}, shutting down...`);
+    shuttingDown = true;
 
-    // Stop timers
-    makers.forEach(({ mm }) => mm.stop());
-
-    // Cancel all open orders
-    await Promise.allSettled(
-      resolvedMarkets.map(cfg => cancelMarketOrders(cfg.condition_id))
+    const shutdownResults = await Promise.allSettled(
+      makers.map(async ({ mm }) => ({
+        conditionId: mm.conditionId,
+        result: await mm.shutdown(),
+      }))
     );
+
+    let exitCode = 0;
+    for (const outcome of shutdownResults) {
+      if (outcome.status === 'rejected') {
+        exitCode = 1;
+        logger.error('[Main] Market maker shutdown failed:', outcome.reason);
+        continue;
+      }
+
+      if (!outcome.value.result.safeToExit) {
+        exitCode = 1;
+        logger.error(
+          `[Main] Unsafe shutdown for ${outcome.value.conditionId.slice(0, 10)}…: ${outcome.value.result.reason}`
+        );
+      }
+    }
 
     // Disconnect WS and stop heartbeat
     wsManager.disconnect();
     userWsManager.disconnect();
     stopHeartbeat();
 
-    logger.info('[Main] Shutdown complete');
-    process.exit(0);
+    logger.info(`[Main] Shutdown complete (exitCode=${exitCode})`);
+    process.exit(exitCode);
   }
 
   process.on('SIGINT', () => shutdown('SIGINT'));

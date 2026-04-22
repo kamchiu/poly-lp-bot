@@ -8,17 +8,22 @@ import { WsManager } from './ws-manager';
 import { UserWsManager } from './user-ws-manager';
 import { PositionMonitor } from './position-monitor';
 import { ResolvedMarketConfig, TrackedOrder } from './types';
-import { roundToTick } from './utils';
+import { roundDownToTick } from './utils';
 import logger from './logger';
+
+const MAX_CACHED_MID_AGE_MS = 15_000;
 
 export class MarketMaker {
   private lastQuotedMid: number | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
   private driftDebounceTimer: NodeJS.Timeout | null = null;
   private cachedMid: number | null = null;
+  private cachedMidUpdatedAt: number | null = null;
   private isRequoting = false;
   private paused = false;
   private hasActiveOrders = false;
+  private cancelInFlight = false;
+  private cancelPromise: Promise<boolean> | null = null;
   private shortId: string;
   readonly positionMonitor: PositionMonitor;
 
@@ -45,15 +50,23 @@ export class MarketMaker {
     this.wsManager.on('midUpdate', (tokenId: string, newMid: number) => {
       if (tokenId !== this.cfg.yes_token_id) return;
       this.cachedMid = newMid;
+      this.cachedMidUpdatedAt = Date.now();
       this.onMidUpdate(newMid);
     });
 
     // Trigger 2: WS reconnect → requote immediately if we have a cached mid
     this.wsManager.on('connected', () => {
-      logger.info(`[${this.shortId}] WS connected event, cachedMid=${this.cachedMid}`);
-      if (this.cachedMid !== null) {
+      const cacheAgeMs = this.cachedMidUpdatedAt === null ? null : Date.now() - this.cachedMidUpdatedAt;
+      logger.info(`[${this.shortId}] WS connected event, cachedMid=${this.cachedMid} cacheAgeMs=${cacheAgeMs}`);
+
+      if (this.cachedMid !== null && cacheAgeMs !== null && cacheAgeMs <= MAX_CACHED_MID_AGE_MS) {
         this.triggerRequote('ws-reconnect');
+        return;
       }
+
+      this.cachedMid = null;
+      this.cachedMidUpdatedAt = null;
+      this.triggerRequote('ws-reconnect');
     });
 
     // Trigger 3: Startup — kick off first requote immediately via REST mid fallback.
@@ -71,15 +84,17 @@ export class MarketMaker {
    * Pause quoting: cancel all LP orders, stop timers and WS tracking.
    * Called when a *different* market fills — this market has no active close.
    */
-  async pause(): Promise<void> {
-    if (this.paused) return;
+  async pause(): Promise<boolean> {
+    if (this.paused) return true;
     this.paused = true;
     this.clearRefreshTimer();
     this.clearDriftDebounce();
-    this.positionMonitor.stopTracking();
-    await cancelMarketOrders(this.cfg.condition_id);
-    this.hasActiveOrders = false;
-    logger.info(`[${this.shortId}] Paused — orders cancelled`);
+
+    const cancelled = await this.cancelOrders('pause');
+    logger.info(
+      `[${this.shortId}] Paused${cancelled ? ' — orders cancelled' : ' — order cancel failed or still in flight'}`
+    );
+    return cancelled;
   }
 
   /**
@@ -93,6 +108,54 @@ export class MarketMaker {
     this.clearRefreshTimer();
     this.clearDriftDebounce();
     logger.info(`[${this.shortId}] Paused for close — quoting stopped, WS listener kept`);
+  }
+
+  async pauseForRisk(reason: string): Promise<void> {
+    this.paused = true;
+    this.clearRefreshTimer();
+    this.clearDriftDebounce();
+
+    if (this.positionMonitor.hasActiveCloseOrder()) {
+      logger.error(
+        `[${this.shortId}] Risk pause (${reason}) — close order is active, leaving it on exchange`
+      );
+      return;
+    }
+
+    const cancelled = await this.cancelOrders(`risk:${reason}`);
+    logger.error(
+      `[${this.shortId}] Risk pause (${reason})${cancelled ? ' — orders cancelled' : ' — order cancel failed or still in flight'}`
+    );
+  }
+
+  async shutdown(): Promise<{ safeToExit: boolean; reason?: string }> {
+    this.paused = true;
+    this.clearRefreshTimer();
+    this.clearDriftDebounce();
+
+    const hadClosingState = this.positionMonitor.isClosing();
+    const hasActiveCloseOrder = this.positionMonitor.hasActiveCloseOrder();
+
+    if (hasActiveCloseOrder) {
+      logger.error(
+        `[${this.shortId}] Shutdown requested while close order is active — refusing clean exit`
+      );
+      this.positionMonitor.stop();
+      return { safeToExit: false, reason: 'close-order-active' };
+    }
+
+    const cancelled = await this.cancelOrders('shutdown');
+    this.positionMonitor.stop();
+
+    if (!cancelled) {
+      return { safeToExit: false, reason: 'shutdown-cancel-failed' };
+    }
+
+    if (hadClosingState) {
+      return { safeToExit: false, reason: 'position-monitor-active' };
+    }
+
+    return { safeToExit: true };
   }
 
   /** Resume quoting after a cross-market pause. */
@@ -147,6 +210,10 @@ export class MarketMaker {
       logger.info(`[${this.shortId}] triggerRequote(${reason}): deferred, close in progress`);
       return;
     }
+    if (this.cancelInFlight) {
+      logger.debug(`[${this.shortId}] triggerRequote(${reason}): skipped, cancel in flight`);
+      return;
+    }
     logger.info(`[${this.shortId}] triggerRequote(${reason}): firing`);
     this.clearRefreshTimer();
     this.requote(reason).catch(err =>
@@ -173,10 +240,8 @@ export class MarketMaker {
         `[${this.shortId}] onMidUpdate: drift=${drift.toFixed(4)} > threshold=${threshold.toFixed(4)}, ` +
         `cancelling orders, debouncing requote`
       );
-      this.hasActiveOrders = false;
-      this.positionMonitor.stopTracking();
-      cancelMarketOrders(this.cfg.condition_id).catch(err =>
-        logger.error(`[${this.shortId}] cancelMarketOrders (drift) error:`, err)
+      this.cancelOrders('drift').catch(err =>
+        logger.error(`[${this.shortId}] cancelOrders (drift) error:`, err)
       );
     } else {
       logger.debug(
@@ -190,7 +255,7 @@ export class MarketMaker {
     this.clearRefreshTimer();
     this.driftDebounceTimer = setTimeout(() => {
       this.driftDebounceTimer = null;
-      this.triggerRequote('drift');
+      this.triggerDriftRequoteWhenReady();
     }, 3000);
   }
 
@@ -217,8 +282,8 @@ export class MarketMaker {
       //    BUY YES @ (mid - s)
       //    BUY NO  @ (1 - (mid + s))
       //    Both consume USDC — no token inventory required.
-      const yesBid = roundToTick(mid - s, tick_size);
-      const noPrice = roundToTick(1 - (mid + s), tick_size);
+      const yesBid = roundDownToTick(mid - s, tick_size);
+      const noPrice = roundDownToTick(1 - (mid + s), tick_size);
 
       // Sanity check
       if (yesBid <= 0 || yesBid >= 1 || noPrice <= 0 || noPrice >= 1) {
@@ -232,8 +297,11 @@ export class MarketMaker {
       );
 
       // 6. Cancel existing orders
-      await cancelMarketOrders(this.cfg.condition_id);
-      this.hasActiveOrders = false;
+      const cancelled = await this.cancelOrders(`requote:${reason}`);
+      if (!cancelled) {
+        logger.warn(`[${this.shortId}] requote(${reason}): cancel failed, skipping placement`);
+        return;
+      }
 
       // 7. Place new orders: BUY YES + BUY NO (both use USDC as collateral)
       const [yesBidId, noBidId] = await Promise.all([
@@ -266,5 +334,44 @@ export class MarketMaker {
       // Always schedule next refresh after requote completes (success or failure)
       this.scheduleRefresh();
     }
+  }
+
+  private async cancelOrders(reason: string): Promise<boolean> {
+    if (this.cancelPromise) {
+      logger.debug(`[${this.shortId}] cancelOrders(${reason}): awaiting existing cancel`);
+      return this.cancelPromise;
+    }
+
+    this.cancelInFlight = true;
+    this.cancelPromise = (async () => {
+      const cancelled = await cancelMarketOrders(this.cfg.condition_id);
+      if (!cancelled) {
+        logger.warn(`[${this.shortId}] cancelOrders(${reason}) failed`);
+        return false;
+      }
+
+      this.hasActiveOrders = false;
+      if (!this.positionMonitor.isClosing()) {
+        this.positionMonitor.stopTracking();
+      }
+      return true;
+    })().finally(() => {
+      this.cancelInFlight = false;
+      this.cancelPromise = null;
+    });
+
+    return this.cancelPromise;
+  }
+
+  private triggerDriftRequoteWhenReady(): void {
+    if (this.cancelInFlight) {
+      this.driftDebounceTimer = setTimeout(() => {
+        this.driftDebounceTimer = null;
+        this.triggerDriftRequoteWhenReady();
+      }, 250);
+      return;
+    }
+
+    this.triggerRequote('drift');
   }
 }

@@ -9,7 +9,8 @@ export interface MarketInfo {
 }
 
 let client: ClobClient;
-let heartbeatTimer: NodeJS.Timeout;
+let heartbeatTimer: NodeJS.Timeout | null = null;
+let heartbeatInFlight: Promise<void> | null = null;
 let lastHeartbeatId: string | null = null;
 let storedApiCreds: { key: string; secret: string; passphrase: string } | null = null;
 
@@ -33,8 +34,8 @@ export async function initClient(host: string, chainId: number, privateKey: stri
   // Log USDC balance and allowance so misconfigured accounts are caught early
   try {
     await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-    const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }) as any;
-    logger.info(`[Client] Raw balance response: ${JSON.stringify(bal)}`);
+    await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    logger.info('[Client] Collateral balance and allowance fetched');
   } catch (err) {
     logger.warn('[Client] Could not fetch balance/allowance:', err);
   }
@@ -42,30 +43,41 @@ export async function initClient(host: string, chainId: number, privateKey: stri
   // Heartbeat: post every 5s to keep orders alive.
   // postHeartbeat() requires chaining: pass the previous heartbeat_id back each time.
   // If heartbeats lapse for 10s, the exchange auto-cancels all orders.
-  heartbeatTimer = setInterval(async () => {
-    try {
-      const resp = await client.postHeartbeat(lastHeartbeatId);
-      const r = resp as any;
-      if (r.error || r.status >= 400) {
-        // Chain broke — start a new one
-        logger.warn(`[Client] Heartbeat chain invalid, restarting: ${JSON.stringify(r)}`);
-        const fresh = await client.postHeartbeat();
-        lastHeartbeatId = (fresh as any).heartbeat_id ?? null;
-        logger.info(`[Client] New heartbeat chain: ${lastHeartbeatId}`);
-      } else {
-        lastHeartbeatId = r.heartbeat_id ?? lastHeartbeatId;
-        logger.debug(`[Client] Heartbeat OK (id=${lastHeartbeatId})`);
-      }
-    } catch (err) {
-      logger.error('[Client] Heartbeat FAILED:', err);
-      // Try to restart chain on next tick
-      lastHeartbeatId = null;
+  heartbeatTimer = setInterval(() => {
+    if (heartbeatInFlight) {
+      logger.debug('[Client] Heartbeat tick skipped — previous request still in flight');
+      return;
     }
+
+    heartbeatInFlight = (async () => {
+      try {
+        const resp = await client.postHeartbeat(lastHeartbeatId);
+        const r = resp as any;
+        if (r.error || r.status >= 400) {
+          // Chain broke — start a new one
+          logger.warn(`[Client] Heartbeat chain invalid, restarting: ${JSON.stringify(r)}`);
+          const fresh = await client.postHeartbeat();
+          lastHeartbeatId = (fresh as any).heartbeat_id ?? null;
+          logger.info(`[Client] New heartbeat chain: ${lastHeartbeatId}`);
+        } else {
+          lastHeartbeatId = r.heartbeat_id ?? lastHeartbeatId;
+          logger.debug(`[Client] Heartbeat OK (id=${lastHeartbeatId})`);
+        }
+      } catch (err) {
+        logger.error('[Client] Heartbeat FAILED:', err);
+        // Try to restart chain on next tick
+        lastHeartbeatId = null;
+      }
+    })().finally(() => {
+      heartbeatInFlight = null;
+    });
   }, 5000);
 }
 
 export function stopHeartbeat(): void {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  heartbeatInFlight = null;
 }
 
 /** Returns the API credentials derived during initClient. Throws if called before initClient. */
@@ -120,17 +132,40 @@ export async function getRestMid(tokenId: string): Promise<number | null> {
   }
 }
 
+export async function getBestBidAsk(
+  tokenId: string
+): Promise<{ bestBid: number | null; bestAsk: number | null }> {
+  try {
+    const [bidResp, askResp] = await Promise.all([
+      client.getPrice(tokenId, 'BUY'),
+      client.getPrice(tokenId, 'SELL'),
+    ]);
+    const bestBid = parseFloat((bidResp as any).price);
+    const bestAsk = parseFloat((askResp as any).price);
+
+    return {
+      bestBid: isFinite(bestBid) && bestBid > 0 ? bestBid : null,
+      bestAsk: isFinite(bestAsk) && bestAsk > 0 ? bestAsk : null,
+    };
+  } catch (err) {
+    logger.info(`[Client] getBestBidAsk unavailable for token ${tokenId.slice(0, 10)}...:`, err);
+    return { bestBid: null, bestAsk: null };
+  }
+}
+
 export async function getOpenOrders(conditionId: string): Promise<any[]> {
   const resp = await client.getOpenOrders({ market: conditionId } as any);
   return Array.isArray(resp) ? resp : [];
 }
 
-export async function cancelMarketOrders(conditionId: string): Promise<void> {
+export async function cancelMarketOrders(conditionId: string): Promise<boolean> {
   try {
     await client.cancelMarketOrders({ market: conditionId } as any);
     logger.info(`[Client] Cancelled orders for market ${conditionId.slice(0, 10)}...`);
+    return true;
   } catch (err) {
     logger.warn(`[Client] cancelMarketOrders failed for ${conditionId}:`, err);
+    return false;
   }
 }
 
@@ -189,24 +224,30 @@ export async function getOrderStatus(orderId: string): Promise<OrderStatus | nul
   }
 }
 
-export async function cancelOrder(orderId: string): Promise<void> {
+export async function cancelOrder(orderId: string): Promise<boolean> {
   try {
     await client.cancelOrder({ orderID: orderId });
     logger.info(`[Client] Cancelled order ${orderId}`);
+    return true;
   } catch (err) {
     logger.warn(`[Client] cancelOrder failed for ${orderId}:`, err);
+    return false;
   }
 }
 
 export async function getTokenBalance(tokenId: string): Promise<number> {
   try {
-    await client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: tokenId });
-    const bal = await client.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: tokenId }) as any;
-    const balance = parseFloat(bal.balance) || 0;
-    logger.debug(`[Client] Token balance for ${tokenId.slice(0, 10)}...: ${balance}`);
-    return balance;
+    return await getTokenBalanceStrict(tokenId);
   } catch (err) {
     logger.warn(`[Client] getTokenBalance failed for ${tokenId}:`, err);
     return 0;
   }
+}
+
+export async function getTokenBalanceStrict(tokenId: string): Promise<number> {
+  await client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: tokenId });
+  const bal = await client.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: tokenId }) as any;
+  const balance = parseFloat(bal.balance) || 0;
+  logger.debug(`[Client] Token balance for ${tokenId.slice(0, 10)}...: ${balance}`);
+  return balance;
 }

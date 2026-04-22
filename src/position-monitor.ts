@@ -1,12 +1,23 @@
 import { EventEmitter } from 'events';
-import { placeLimitOrder, getTokenBalance } from './client';
-import { notifyFill, notifyClosePlaced, notifyCloseComplete } from './notifier';
+import {
+  cancelMarketOrders,
+  cancelOrder,
+  getBestBidAsk,
+  getMarketInfo,
+  placeLimitOrder,
+  getTokenBalance,
+} from './client';
+import { notifyFill, notifyClosePlaced, notifyCloseComplete, notifyCloseFailed } from './notifier';
 import { UserWsManager } from './user-ws-manager';
 import { TrackedOrder } from './types';
+import { roundToTick } from './utils';
 import logger from './logger';
 
-/** Markup applied to the fill price when placing the close limit order. */
-const CLOSE_PRICE_MARKUP = 0.05; // +5%
+/** Start by aiming for a small edge, then chase the market down if it does not fill. */
+const INITIAL_CLOSE_MARKUP = 0.01; // +1%
+const CLOSE_REPRICE_STEP = 0.01; // tighten by 1pp on each retry
+const MIN_CLOSE_MARKUP = -0.02; // allow up to 2% loss for a fast exit
+const CLOSE_REPRICE_INTERVAL_MS = 5000;
 
 interface CloseState {
   tokenId: string;
@@ -15,6 +26,9 @@ interface CloseState {
   fillPrice: number;
   closePrice: number;
   closeOrderId: string | null;
+  closeOrderIds: string[];
+  closeAttempt: number;
+  phase: 'cancelling-lp' | 'awaiting-balance' | 'placing-limit' | 'waiting-close-fill' | 'risk-locked';
 }
 
 /**
@@ -23,22 +37,33 @@ interface CloseState {
  *
  * Strategy:
  *   1. Detect fill via `fill` events from UserWsManager (real-time, no polling)
- *   2. Place SELL limit order at fillPrice × (1 + CLOSE_PRICE_MARKUP) (+5%)
- *   3. Accumulate close-order fill events until sizeFilled >= sizeTarget
- *   4. Only then does 'closeComplete' fire and quoting resume
+ *   2. Cancel remaining LP orders in the same market before placing the close
+ *   3. Place a fast SELL close order near the live book with a small target edge
+ *   4. Reprice the close order on a timer until it fills or we risk-lock
+ *   5. Accumulate close-order fill events until sizeFilled >= sizeTarget
+ *   6. Only then does 'closeComplete' fire and quoting resume
  *
  * Events emitted:
  *   - 'fillDetected'  : a fill was detected, closing is about to start
  *   - 'closeComplete' : close limit order fully filled; safe to resume quoting
+ *   - 'closeFailed'   : position state is unsafe; quoting must remain paused
  */
 export class PositionMonitor extends EventEmitter {
   private trackedOrders: TrackedOrder[] = [];
   /** orderIds of our active LP orders — exact match prevents spurious triggers. */
   private watchedOrderIds = new Set<string>();
-  /** Fills already accumulated per orderId — prevents double-counting on replay. */
+  /** Fills already accumulated per orderId — caps processing at the original order size. */
   private processedFill = new Map<string, number>();
+  /** Idempotency keys for buy-order fills delivered via user WS replay. */
+  private processedBuyEvents = new Set<string>();
+  /** Idempotency keys for close-order fills delivered via user WS replay. */
+  private processedCloseEvents = new Set<string>();
   private closing: CloseState | null = null;
+  private riskLockReason: string | null = null;
+  private closeWorkflow: Promise<void> | null = null;
+  private fillDetectedEmitted = false;
   private shortId: string;
+  private closeRepriceTimer: NodeJS.Timeout | null = null;
 
   /** Bound listener reference — kept so we can cleanly remove it on stop(). */
   private readonly onWsFill: (event: WsFillEvent) => void;
@@ -59,12 +84,21 @@ export class PositionMonitor extends EventEmitter {
     this.trackedOrders = orders;
     this.watchedOrderIds = new Set(orders.map(o => o.orderId));
     this.processedFill.clear();
+    this.processedBuyEvents.clear();
     logger.debug(`[${this.shortId}] Tracking ${orders.length} order(s): ${orders.map(o => o.orderId).join(', ')}`);
   }
 
   /** Whether a close operation is in progress (MarketMaker should defer requote). */
   isClosing(): boolean {
-    return this.closing !== null;
+    return this.closing !== null || this.riskLockReason !== null;
+  }
+
+  hasActiveCloseOrder(): boolean {
+    return this.closing?.closeOrderId != null;
+  }
+
+  isRiskLocked(): boolean {
+    return this.riskLockReason !== null;
   }
 
   /**
@@ -73,25 +107,39 @@ export class PositionMonitor extends EventEmitter {
    */
   stop(): void {
     this.userWs.off('fill', this.onWsFill);
-    this.clearCloseState();
-    this.trackedOrders = [];
-    this.watchedOrderIds.clear();
-    this.processedFill.clear();
+    this.resetAllState();
   }
 
   /**
    * Stop tracking LP orders only — does NOT remove the WS fill listener.
-   * Use this when THIS market's LP order has filled and we are waiting for
-   * the close order fill. The WS listener must stay alive to catch it.
+   * Use this only after order cancellation is confirmed.
    */
   stopTracking(): void {
     this.trackedOrders = [];
     this.watchedOrderIds.clear();
     this.processedFill.clear();
+    this.processedBuyEvents.clear();
   }
 
   private clearCloseState(): void {
+    this.clearCloseRepriceTimer();
     this.closing = null;
+    this.processedCloseEvents.clear();
+    this.closeWorkflow = null;
+    this.fillDetectedEmitted = false;
+  }
+
+  private resetAllState(): void {
+    this.stopTracking();
+    this.clearCloseState();
+    this.riskLockReason = null;
+  }
+
+  private clearCloseRepriceTimer(): void {
+    if (this.closeRepriceTimer) {
+      clearTimeout(this.closeRepriceTimer);
+      this.closeRepriceTimer = null;
+    }
   }
 
   private handleFill(event: WsFillEvent): void {
@@ -99,7 +147,7 @@ export class PositionMonitor extends EventEmitter {
       `[${this.shortId}] handleFill: orderId=${event.orderId.slice(0, 10)}… ` +
       `eventConditionId=${event.conditionId?.slice(0, 10) || 'null'}… ` +
       `thisConditionId=${this.conditionId.slice(0, 10)}… ` +
-      `watched=${this.watchedOrderIds.has(event.orderId)} closing=${!!this.closing}`
+      `watched=${this.watchedOrderIds.has(event.orderId)} closing=${this.isClosing()}`
     );
 
     // Filter to fills in our market (conditionId match)
@@ -109,75 +157,190 @@ export class PositionMonitor extends EventEmitter {
     }
 
     // Case 1: fill on one of our tracked LP (buy) orders — exact orderId match
-    if (this.watchedOrderIds.has(event.orderId) && !this.closing) {
+    if (this.watchedOrderIds.has(event.orderId)) {
       this.handleBuyFill(event);
       return;
     }
 
     // Case 2: fill on our close (SELL) order
-    if (this.closing?.closeOrderId && event.orderId === this.closing.closeOrderId) {
+    if (this.closing?.closeOrderIds.includes(event.orderId)) {
       this.handleCloseFill(event);
     }
   }
 
   private handleBuyFill(event: WsFillEvent): void {
+    const tracked = this.trackedOrders.find(order => order.orderId === event.orderId);
+    if (!tracked) return;
+
+    if (this.processedBuyEvents.has(event.eventKey)) {
+      logger.debug(`[${this.shortId}] Ignoring duplicate buy fill event ${event.eventKey}`);
+      return;
+    }
+    this.processedBuyEvents.add(event.eventKey);
+
     const alreadyProcessed = this.processedFill.get(event.orderId) ?? 0;
-    const newFillSize = event.size;
+    const remainingForOrder = Math.max(0, tracked.size - alreadyProcessed);
+    const appliedFillSize = Math.min(event.size, remainingForOrder);
 
-    if (newFillSize <= 0) return;
+    if (appliedFillSize <= 0) {
+      logger.debug(
+        `[${this.shortId}] Ignoring buy fill: raw=${event.size} remaining=${remainingForOrder} orderId=${event.orderId}`
+      );
+      return;
+    }
 
-    const totalProcessed = alreadyProcessed + newFillSize;
-    this.processedFill.set(event.orderId, totalProcessed);
+    if (this.riskLockReason) {
+      logger.error(
+        `[${this.shortId}] Buy fill received while risk-locked (${this.riskLockReason}) orderId=${event.orderId}`
+      );
+      return;
+    }
+
+    if (this.closing?.phase === 'placing-limit') {
+      this.enterRiskLock('buy-fill-while-placing-close');
+      return;
+    }
+
+    if (this.closing?.closeOrderId) {
+      this.enterRiskLock('buy-fill-after-close-placed');
+      return;
+    }
+
+    if (this.closing && this.closing.tokenId !== event.assetId) {
+      this.enterRiskLock('multiple-token-fills');
+      return;
+    }
+
+    this.processedFill.set(event.orderId, alreadyProcessed + appliedFillSize);
+
+    if (!this.closing) {
+      this.closing = {
+        tokenId: event.assetId,
+        sizeTarget: appliedFillSize,
+        sizeFilled: 0,
+        fillPrice: event.price,
+        closePrice: event.price,
+        closeOrderId: null,
+        closeOrderIds: [],
+        closeAttempt: 0,
+        phase: 'cancelling-lp',
+      };
+    } else {
+      this.closing.sizeTarget += appliedFillSize;
+      if (event.price > this.closing.fillPrice) {
+        this.closing.fillPrice = event.price;
+      }
+    }
 
     logger.info(
       `[${this.shortId}] Buy fill detected: orderId=${event.orderId} assetId=${event.assetId.slice(0, 10)}… ` +
-      `side=${event.side} size=${newFillSize} total=${totalProcessed} @ ${event.price}`
+      `side=${event.side} size=${appliedFillSize} orderFilled=${this.processedFill.get(event.orderId)}/${tracked.size} ` +
+      `closeTarget=${this.closing.sizeTarget} @ ${event.price}`
     );
 
-    // Stop watching for more LP-order fills — we are now managing a close.
-    // WS listener stays registered (stopTracking, not stop).
-    this.stopTracking();
-
-    // Pause all markets via index.ts listener.
-    // index.ts will call pauseForClose() on THIS market (keeps listener alive)
-    // and pause() on other markets (cancels their LP orders).
-    this.emit('fillDetected', this.conditionId);
+    if (!this.fillDetectedEmitted) {
+      this.fillDetectedEmitted = true;
+      this.emit('fillDetected', this.conditionId);
+    }
 
     notifyFill({
       conditionId: this.conditionId,
       side: event.side as 'BUY' | 'SELL',
       tokenId: event.assetId,
-      size: newFillSize,
+      size: appliedFillSize,
       price: event.price,
       orderId: event.orderId,
     }).catch(() => {/* ignore notification errors */});
 
-    this.closePosition(event.assetId, totalProcessed, event.price).catch(err => {
-      logger.error(`[${this.shortId}] closePosition error:`, err);
-    });
+    if (!this.closeWorkflow) {
+      this.closeWorkflow = this.beginCloseWorkflow().catch(err => {
+        logger.error(`[${this.shortId}] closePosition error:`, err);
+        this.enterRiskLock('close-workflow-error');
+      }).finally(() => {
+        this.closeWorkflow = null;
+      });
+    }
   }
 
   private handleCloseFill(event: WsFillEvent): void {
     if (!this.closing) return;
 
-    this.closing.sizeFilled += event.size;
+    if (this.processedCloseEvents.has(event.eventKey)) {
+      logger.debug(`[${this.shortId}] Ignoring duplicate close fill event ${event.eventKey}`);
+      return;
+    }
+    this.processedCloseEvents.add(event.eventKey);
+
+    const remainingToClose = Math.max(0, this.closing.sizeTarget - this.closing.sizeFilled);
+    const appliedFillSize = Math.min(event.size, remainingToClose);
+    if (appliedFillSize <= 0) {
+      logger.debug(
+        `[${this.shortId}] Ignoring close fill: raw=${event.size} remaining=${remainingToClose} orderId=${event.orderId}`
+      );
+      return;
+    }
+
+    this.closing.sizeFilled += appliedFillSize;
     logger.info(
-      `[${this.shortId}] Close fill: orderId=${event.orderId} size=${event.size} ` +
+      `[${this.shortId}] Close fill: orderId=${event.orderId} size=${appliedFillSize} ` +
       `filled=${this.closing.sizeFilled}/${this.closing.sizeTarget} @ ${event.price}`
     );
 
     if (this.closing.sizeFilled >= this.closing.sizeTarget) {
+      if (this.riskLockReason) {
+        logger.warn(
+          `[${this.shortId}] Close filled but market remains risk-locked (${this.riskLockReason})`
+        );
+        this.stopTracking();
+        this.clearCloseState();
+        return;
+      }
       this.finishClose('limit-filled');
     }
   }
 
-  private async closePosition(tokenId: string, size: number, fillPrice: number): Promise<void> {
-    const closePrice = parseFloat((fillPrice * (1 + CLOSE_PRICE_MARKUP)).toFixed(4));
+  private async computeClosePrice(): Promise<number> {
+    if (!this.closing) {
+      throw new Error('computeClosePrice called without active closing state');
+    }
+
+    const { tick_size } = await getMarketInfo(this.conditionId, 0.01);
+    const { bestBid, bestAsk } = await getBestBidAsk(this.closing.tokenId);
+    const markup = Math.max(
+      INITIAL_CLOSE_MARKUP - (this.closing.closeAttempt * CLOSE_REPRICE_STEP),
+      MIN_CLOSE_MARKUP,
+    );
+    const targetPrice = this.closing.fillPrice * (1 + markup);
+
+    let candidatePrice = targetPrice;
+    if (bestBid !== null && bestAsk !== null && bestBid < bestAsk) {
+      candidatePrice = Math.min(bestAsk, Math.max(bestBid, targetPrice));
+    } else if (bestAsk !== null) {
+      candidatePrice = Math.min(bestAsk, targetPrice);
+    } else if (bestBid !== null) {
+      candidatePrice = Math.max(bestBid, targetPrice);
+    }
+
+    const boundedPrice = Math.min(Math.max(candidatePrice, tick_size), 1 - tick_size);
+    return roundToTick(boundedPrice, tick_size);
+  }
+
+  private async beginCloseWorkflow(): Promise<void> {
+    if (!this.closing) return;
 
     logger.info(
-      `[${this.shortId}] Closing position: SELL ${size} token=${tokenId.slice(0, 10)}… ` +
-      `fillPrice=${fillPrice} closePrice=${closePrice} (+${(CLOSE_PRICE_MARKUP * 100).toFixed(0)}%)`
+      `[${this.shortId}] Closing position: SELL ${this.closing.sizeTarget} token=${this.closing.tokenId.slice(0, 10)}… ` +
+      `fillPrice=${this.closing.fillPrice}`
     );
+
+    const cancelled = await cancelMarketOrders(this.conditionId);
+    if (!cancelled) {
+      this.enterRiskLock('lp-cancel-failed');
+      return;
+    }
+    if (!this.closing) return;
+
+    this.closing.phase = 'awaiting-balance';
 
     // Wait for token balance to arrive (settlement delay after fill)
     const maxWaitMs = 30000; // 30s timeout
@@ -186,54 +349,142 @@ export class PositionMonitor extends EventEmitter {
     let balance = 0;
 
     while (Date.now() - startTime < maxWaitMs) {
-      balance = await getTokenBalance(tokenId);
-      if (balance >= size) {
-        logger.info(`[${this.shortId}] Token balance confirmed: ${balance} >= ${size}`);
+      if (!this.closing) return;
+      balance = await getTokenBalance(this.closing.tokenId);
+      if (balance >= this.closing.sizeTarget) {
+        logger.info(`[${this.shortId}] Token balance confirmed: ${balance} >= ${this.closing.sizeTarget}`);
         break;
       }
-      logger.debug(`[${this.shortId}] Waiting for balance: ${balance}/${size} (${Math.floor((Date.now() - startTime) / 1000)}s)`);
+      logger.debug(
+        `[${this.shortId}] Waiting for balance: ${balance}/${this.closing.sizeTarget} ` +
+        `(${Math.floor((Date.now() - startTime) / 1000)}s)`
+      );
       await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
     }
 
-    if (balance < size) {
-      logger.warn(`[${this.shortId}] Balance timeout: ${balance}/${size} after ${maxWaitMs}ms — abandoning position`);
-      this.finishClose('balance-timeout');
+    if (!this.closing) return;
+    if (balance < this.closing.sizeTarget) {
+      logger.warn(
+        `[${this.shortId}] Balance timeout: ${balance}/${this.closing.sizeTarget} after ${maxWaitMs}ms — risk locking`
+      );
+      this.enterRiskLock('balance-timeout');
       return;
     }
 
-    const closeOrderId = await placeLimitOrder('SELL', closePrice, size, tokenId);
+    await this.placeCloseOrder('initial');
+  }
 
-    this.closing = {
-      tokenId,
-      sizeTarget: size,
-      sizeFilled: 0,
-      fillPrice,
+  private async placeCloseOrder(reason: 'initial' | 'reprice'): Promise<void> {
+    if (!this.closing) return;
+
+    const remainingToClose = Math.max(0, this.closing.sizeTarget - this.closing.sizeFilled);
+    if (remainingToClose <= 0) {
+      this.finishClose('already-filled');
+      return;
+    }
+
+    this.closing.phase = 'placing-limit';
+    const closePrice = await this.computeClosePrice();
+    const closeOrderId = await placeLimitOrder(
+      'SELL',
       closePrice,
-      closeOrderId,
-    };
+      remainingToClose,
+      this.closing.tokenId,
+    );
 
     if (!closeOrderId) {
-      logger.warn(`[${this.shortId}] Close limit order placement failed — abandoning position`);
-      this.finishClose('limit-placement-failed');
+      logger.warn(`[${this.shortId}] Close ${reason} placement failed — risk locking`);
+      this.enterRiskLock(reason === 'initial' ? 'limit-placement-failed' : 'close-reprice-placement-failed');
       return;
     }
 
-    logger.info(`[${this.shortId}] Close limit order placed: ${closeOrderId} — waiting for WS fill event`);
+    if (!this.closing) return;
+    this.closing.closeOrderId = closeOrderId;
+    this.closing.closePrice = closePrice;
+    this.closing.closeOrderIds.push(closeOrderId);
+    this.closing.closeAttempt += 1;
+    this.closing.phase = 'waiting-close-fill';
 
-    await notifyClosePlaced({
-      conditionId: this.conditionId,
-      tokenId,
-      size,
-      closePrice,
-      fillPrice,
-      orderId: closeOrderId,
-    });
+    if (reason === 'initial') {
+      logger.info(`[${this.shortId}] Close limit order placed: ${closeOrderId} @ ${closePrice} — waiting for WS fill event`);
+      await notifyClosePlaced({
+        conditionId: this.conditionId,
+        tokenId: this.closing.tokenId,
+        size: remainingToClose,
+        closePrice: this.closing.closePrice,
+        fillPrice: this.closing.fillPrice,
+        orderId: closeOrderId,
+      });
+    } else {
+      logger.info(
+        `[${this.shortId}] Close limit order repriced: ${closeOrderId} @ ${closePrice} ` +
+        `remaining=${remainingToClose}`
+      );
+    }
+
+    this.scheduleCloseReprice();
+  }
+
+  private scheduleCloseReprice(): void {
+    this.clearCloseRepriceTimer();
+
+    if (!this.closing || this.riskLockReason) return;
+
+    this.closeRepriceTimer = setTimeout(() => {
+      this.closeRepriceTimer = null;
+      this.repriceCloseOrder().catch(err => {
+        logger.error(`[${this.shortId}] close repricing error:`, err);
+        this.enterRiskLock('close-reprice-error');
+      });
+    }, CLOSE_REPRICE_INTERVAL_MS);
+  }
+
+  private async repriceCloseOrder(): Promise<void> {
+    if (!this.closing || this.riskLockReason) return;
+
+    const remainingToClose = Math.max(0, this.closing.sizeTarget - this.closing.sizeFilled);
+    if (remainingToClose <= 0) {
+      this.finishClose('limit-filled');
+      return;
+    }
+
+    const currentCloseOrderId = this.closing.closeOrderId;
+    if (!currentCloseOrderId) {
+      this.enterRiskLock('close-order-missing');
+      return;
+    }
+
+    const cancelled = await cancelOrder(currentCloseOrderId);
+    if (!cancelled) {
+      this.enterRiskLock('close-reprice-cancel-failed');
+      return;
+    }
+
+    if (!this.closing) return;
+    this.closing.closeOrderId = null;
+    await this.placeCloseOrder('reprice');
+  }
+
+  private enterRiskLock(reason: string): void {
+    if (this.riskLockReason) return;
+
+    this.clearCloseRepriceTimer();
+    this.riskLockReason = reason;
+    if (this.closing) {
+      this.closing.phase = 'risk-locked';
+    }
+
+    logger.error(`[${this.shortId}] Risk lock (${reason})`);
+    notifyCloseFailed({ conditionId: this.conditionId, reason }).catch(() => {/* ignore */});
+    this.emit('closeFailed', reason);
   }
 
   private finishClose(reason: string): void {
     logger.info(`[${this.shortId}] Close complete (${reason})`);
     notifyCloseComplete({ conditionId: this.conditionId, reason }).catch(() => {/* ignore */});
+    this.stopTracking();
     this.clearCloseState();
+    this.riskLockReason = null;
     this.emit('closeComplete');
   }
 }
@@ -246,4 +497,5 @@ interface WsFillEvent {
   size: number;
   side: string;
   feeRateBps: number;
+  eventKey: string;
 }

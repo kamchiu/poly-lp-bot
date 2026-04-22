@@ -39,22 +39,33 @@ const MIN_START_DATE: string | -1 = -1;
 /**
  * 24-hour volume range (USD). Too low → thin book, snipe risk. Too high → hot/volatile market.
  */
-const MIN_VOLUME_24H = 500;
+const MIN_VOLUME_24H = 800;
 const MAX_VOLUME_24H = 800_000;
 
 /** Mid-price must stay inside [MIN_MID, MAX_MID] to avoid near-resolved markets. */
-const MIN_MID = 0.2;
-const MAX_MID = 0.8;
+const MIN_MID = 0.1;
+const MAX_MID = 0.9;
 
 /**
  * Maximum market_competitiveness value (from CLOB API).
  * Maps to the 5-bar progress shown on Polymarket UI — lower = less crowded.
  * ≤30 ≈ 1–2 bars (low competition). Raise if you want to include busier markets.
  */
-const MAX_COMPETITIVENESS = 30;
+const MAX_COMPETITIVENESS = 15;
+
+/** Exclude markets whose catalyst / resolution date is too close. */
+const MIN_DAYS_TO_EVENT = 14;
+
+/** Optional exact slug filters. Empty = no manual allow/deny list. */
+const WHITELIST_SLUGS: string[] = [];
+const BLACKLIST_SLUGS: string[] = [];
+
+/** Optional substring filters matched against question / event_slug / market_slug. */
+const WHITELIST_KEYWORDS: string[] = [];
+const BLACKLIST_KEYWORDS: string[] = [];
 
 /** Default number of markets to write into config.yaml (overridden by --count). */
-const DEFAULT_COUNT = 30;
+const DEFAULT_COUNT = 5;
 
 // ---------------------------------------------------------------------------
 // Public CLOB REST base (no auth needed)
@@ -105,7 +116,7 @@ interface MarketToken {
   price: number;
 }
 
-interface MarketReward {
+export interface MarketReward {
   condition_id: string;
   market_id?: string;
   question?: string;
@@ -162,18 +173,107 @@ interface ScoredMarket {
   noTokenId: string;
 }
 
+interface ManualSelectionFilters {
+  whitelistSlugs?: string[];
+  blacklistSlugs?: string[];
+  whitelistKeywords?: string[];
+  blacklistKeywords?: string[];
+  minDaysToEvent?: number;
+}
+
+const DEFAULT_MANUAL_FILTERS: Required<ManualSelectionFilters> = {
+  whitelistSlugs: WHITELIST_SLUGS,
+  blacklistSlugs: BLACKLIST_SLUGS,
+  whitelistKeywords: WHITELIST_KEYWORDS,
+  blacklistKeywords: BLACKLIST_KEYWORDS,
+  minDaysToEvent: MIN_DAYS_TO_EVENT,
+};
+
+function normalizeText(value: string | undefined): string {
+  return (value ?? '').trim().toLowerCase();
+}
+
+function parseDate(value: string | undefined): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (isNaN(date.getTime()) || date.getUTCFullYear() >= 2400) return null;
+  return date;
+}
+
+function getMarketText(reward: MarketReward): string {
+  return [
+    reward.question,
+    reward.market_slug,
+    reward.event_slug,
+  ].map(normalizeText).join(' ');
+}
+
+export function passesManualSelection(
+  reward: MarketReward,
+  filters: ManualSelectionFilters = DEFAULT_MANUAL_FILTERS
+): boolean {
+  const whitelistSlugs = (filters.whitelistSlugs ?? []).map(normalizeText).filter(Boolean);
+  const blacklistSlugs = (filters.blacklistSlugs ?? []).map(normalizeText).filter(Boolean);
+  const whitelistKeywords = (filters.whitelistKeywords ?? []).map(normalizeText).filter(Boolean);
+  const blacklistKeywords = (filters.blacklistKeywords ?? []).map(normalizeText).filter(Boolean);
+
+  const marketSlug = normalizeText(reward.market_slug);
+  const eventSlug = normalizeText(reward.event_slug);
+  const marketText = getMarketText(reward);
+
+  if (blacklistSlugs.includes(marketSlug) || blacklistSlugs.includes(eventSlug)) return false;
+  if (blacklistKeywords.some(keyword => marketText.includes(keyword))) return false;
+
+  const hasWhitelist = whitelistSlugs.length > 0 || whitelistKeywords.length > 0;
+  if (!hasWhitelist) return true;
+
+  return (
+    whitelistSlugs.includes(marketSlug) ||
+    whitelistSlugs.includes(eventSlug) ||
+    whitelistKeywords.some(keyword => marketText.includes(keyword))
+  );
+}
+
+export function getDaysToEvent(reward: MarketReward, now: Date = new Date()): number | null {
+  const candidateDates = [
+    parseDate(reward.end_date),
+    ...reward.rewards_config.map(cfg => parseDate(cfg.end_date)),
+  ].filter((date): date is Date => date !== null);
+
+  if (candidateDates.length === 0) return null;
+
+  const eventDate = candidateDates.reduce((earliest, current) =>
+    current.getTime() < earliest.getTime() ? current : earliest
+  );
+  return (eventDate.getTime() - now.getTime()) / 86_400_000;
+}
+
+export function isNearCatalyst(
+  reward: MarketReward,
+  now: Date = new Date(),
+  minDaysToEvent: number = MIN_DAYS_TO_EVENT
+): boolean {
+  const daysToEvent = getDaysToEvent(reward, now);
+  return daysToEvent !== null && daysToEvent < minDaysToEvent;
+}
+
 /**
  * Validate and score a market.
  * `aggregateDailyRate` is the sum of rate_per_day across ALL condition_ids that
  * share the same underlying YES token (multiple sponsors of the same market).
  */
-function scoreMarket(
+export function scoreMarket(
   reward: MarketReward,
   thresholdDate: Date,
-  aggregateDailyRate: number
+  aggregateDailyRate: number,
+  now: Date = new Date()
 ): ScoredMarket | null {
   // --- Filter: aggregate daily rate range ---
   if (aggregateDailyRate < MIN_DAILY_RATE || aggregateDailyRate > MAX_DAILY_RATE) return null;
+
+  // --- Filter: manual allow/deny lists + near-event catalyst windows ---
+  if (!passesManualSelection(reward)) return null;
+  if (isNearCatalyst(reward, now, MIN_DAYS_TO_EVENT)) return null;
 
   // --- Filter: min_size ---
   if (reward.rewards_min_size > MAX_MIN_SHARES) return null;
@@ -268,7 +368,7 @@ function writeConfig(configPath: string, markets: ScoredMarket[]): void {
   const dumped = yaml.dump(cfg, { lineWidth: 120, quotingType: '"', forceQuotes: false });
   const header = [
     `# Auto-generated by market-scanner.ts on ${new Date().toISOString()}`,
-    `# Top ${markets.length} market(s) by score = daily_rate × (1 - competition) × time_bonus`,
+    `# Top ${markets.length} market(s) by score = daily_rate × (1 - competition)`,
     '',
   ].join('\n');
 
@@ -304,8 +404,19 @@ async function main() {
     `Filters: daily_rate=${MIN_DAILY_RATE}–${MAX_DAILY_RATE} USDC/day | ` +
     `min_size≤${MAX_MIN_SHARES} | start_date>${thresholdDate.toISOString().slice(0, 10)} | ` +
     `vol_24h=${MIN_VOLUME_24H.toLocaleString()}–${MAX_VOLUME_24H.toLocaleString()} | ` +
-    `competitiveness≤${MAX_COMPETITIVENESS} | spread≤rewards_max_spread`
+    `competitiveness≤${MAX_COMPETITIVENESS} | spread≤rewards_max_spread | ` +
+    `days_to_event≥${MIN_DAYS_TO_EVENT}`
   );
+  if (WHITELIST_SLUGS.length > 0 || WHITELIST_KEYWORDS.length > 0) {
+    console.log(
+      `Whitelist: slugs=${WHITELIST_SLUGS.length} keywords=${WHITELIST_KEYWORDS.length}`
+    );
+  }
+  if (BLACKLIST_SLUGS.length > 0 || BLACKLIST_KEYWORDS.length > 0) {
+    console.log(
+      `Blacklist: slugs=${BLACKLIST_SLUGS.length} keywords=${BLACKLIST_KEYWORDS.length}`
+    );
+  }
   console.log(`Target: top ${count} market(s)\n`);
 
   // 1. Fetch all markets from /rewards/markets/multi (paginated)
@@ -363,9 +474,10 @@ async function main() {
   console.log(`Unique underlying tokens: ${tokenGroups.size}`);
 
   // 5. Score all groups — all filters applied here (rate, competitiveness, start_date, volume, mid).
+  const now = new Date();
   const scored: ScoredMarket[] = [];
   for (const { representative: entry, totalRate } of tokenGroups.values()) {
-    const result = scoreMarket(entry.reward, thresholdDate, totalRate);
+    const result = scoreMarket(entry.reward, thresholdDate, totalRate, now);
     if (result !== null) scored.push(result);
   }
   console.log(`After all filters: ${scored.length} market(s) pass`);
@@ -381,16 +493,18 @@ async function main() {
 
   // 7. Print summary table
   console.log('\nSelected markets:');
-  console.log('  #  Score   Rate/day  Compet   StartDate   Mid    Question');
-  console.log('  -- ------  --------  -------  ----------  -----  --------');
+  console.log('  #  Score   Rate/day  Compet   D/Event  StartDate   Mid    Question');
+  console.log('  -- ------  --------  -------  -------  ----------  -----  --------');
   for (let i = 0; i < selected.length; i++) {
     const s = selected[i];
     const startDate = s.reward.rewards_config?.[0]?.start_date?.slice(0, 10) ?? 'unknown';
+    const daysToEvent = getDaysToEvent(s.reward, now);
+    const daysToEventText = daysToEvent === null ? 'n/a' : Math.ceil(daysToEvent).toString();
     const question = (s.reward.question ?? '').slice(0, 55);
     console.log(
       `  ${String(i + 1).padStart(2)}  ${s.score.toFixed(1).padStart(6)}  ` +
       `$${s.dailyRate.toFixed(0).padStart(7)}  ${s.competitiveness.toFixed(1).padStart(7)}  ` +
-      `${startDate}  ${s.mid.toFixed(2)}   ${question}`
+      `${daysToEventText.padStart(7)}  ${startDate}  ${s.mid.toFixed(2)}   ${question}`
     );
   }
 
@@ -399,7 +513,9 @@ async function main() {
   writeConfig(configPath, selected);
 }
 
-main().catch(err => {
-  console.error('Scanner failed:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error('Scanner failed:', err);
+    process.exit(1);
+  });
+}
