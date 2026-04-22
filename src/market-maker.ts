@@ -7,25 +7,60 @@ import {
 import { WsManager } from './ws-manager';
 import { UserWsManager } from './user-ws-manager';
 import { PositionMonitor } from './position-monitor';
-import { ResolvedMarketConfig, TrackedOrder } from './types';
+import { OrderBook, QuoteUpdate, ResolvedMarketConfig, TrackedOrder } from './types';
 import { roundDownToTick } from './utils';
 import logger from './logger';
 
 const MAX_CACHED_MID_AGE_MS = 15_000;
+const DRIFT_REQUOTE_DEBOUNCE_MS = 3_000;
+const DRIFT_REQUOTE_RETRY_MS = 250;
+const QUOTE_COOLDOWN_MS = 5_000;
+const MAX_REQUOTE_SPREAD = 0.02;
+const FLOAT_EPSILON = 1e-9;
+const REQUOTE_BAND_DEPTH_MULTIPLIER = 5;
+
+interface LiveQuoteState {
+  bestBid: number | null;
+  bestAsk: number | null;
+  book: OrderBook | null;
+}
+
+interface ActiveQuoteState {
+  yesBid: number | null;
+  noBid: number | null;
+  tickSize: number;
+}
+
+interface RequoteGuardResult {
+  ok: boolean;
+  reason?: string;
+}
 
 export class MarketMaker {
   private lastQuotedMid: number | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
   private driftDebounceTimer: NodeJS.Timeout | null = null;
+  private quoteCooldownTimer: NodeJS.Timeout | null = null;
   private cachedMid: number | null = null;
   private cachedMidUpdatedAt: number | null = null;
   private isRequoting = false;
   private paused = false;
+  private started = false;
   private hasActiveOrders = false;
   private cancelInFlight = false;
+  private quoteCooldownUntil: number | null = null;
+  private pendingRequoteAfterCooldown = false;
+  private protectiveCancelInFlight = false;
   private cancelPromise: Promise<boolean> | null = null;
+  private yesQuote: LiveQuoteState | null = null;
+  private noQuote: LiveQuoteState | null = null;
+  private activeQuoteState: ActiveQuoteState | null = null;
   private shortId: string;
   readonly positionMonitor: PositionMonitor;
+
+  private readonly onWsMidUpdate: (tokenId: string, newMid: number) => void;
+  private readonly onWsQuoteUpdate: (update: QuoteUpdate) => void;
+  private readonly onWsConnected: () => void;
 
   constructor(
     private readonly cfg: ResolvedMarketConfig,
@@ -38,24 +73,18 @@ export class MarketMaker {
       userWsManager,
     );
 
-    // When a close completes, trigger a fresh requote (unless externally paused)
-    this.positionMonitor.on('closeComplete', () => {
-      logger.info(`[${this.shortId}] Close complete, triggering fresh requote`);
-      this.triggerRequote('close-complete');
-    });
-  }
-
-  start(): void {
-    // Trigger 1: WS event-driven — drift check on YES token mid updates
-    this.wsManager.on('midUpdate', (tokenId: string, newMid: number) => {
+    this.onWsMidUpdate = (tokenId: string, newMid: number) => {
       if (tokenId !== this.cfg.yes_token_id) return;
       this.cachedMid = newMid;
       this.cachedMidUpdatedAt = Date.now();
       this.onMidUpdate(newMid);
-    });
+    };
 
-    // Trigger 2: WS reconnect → requote immediately if we have a cached mid
-    this.wsManager.on('connected', () => {
+    this.onWsQuoteUpdate = (update: QuoteUpdate) => {
+      this.handleQuoteUpdate(update);
+    };
+
+    this.onWsConnected = () => {
       const cacheAgeMs = this.cachedMidUpdatedAt === null ? null : Date.now() - this.cachedMidUpdatedAt;
       logger.info(`[${this.shortId}] WS connected event, cachedMid=${this.cachedMid} cacheAgeMs=${cacheAgeMs}`);
 
@@ -67,14 +96,35 @@ export class MarketMaker {
       this.cachedMid = null;
       this.cachedMidUpdatedAt = null;
       this.triggerRequote('ws-reconnect');
-    });
+    };
 
-    // Trigger 3: Startup — kick off first requote immediately via REST mid fallback.
+    // When a close completes, trigger a fresh requote (unless externally paused)
+    this.positionMonitor.on('closeComplete', () => {
+      logger.info(`[${this.shortId}] Close complete, triggering fresh requote`);
+      this.triggerRequote('close-complete');
+    });
+  }
+
+  start(): void {
+    if (this.started) return;
+    this.started = true;
+    this.wsManager.on('midUpdate', this.onWsMidUpdate);
+    this.wsManager.on('quoteUpdate', this.onWsQuoteUpdate);
+    this.wsManager.on('connected', this.onWsConnected);
+
+    // Startup — kick off first requote immediately via REST mid fallback.
     // Inactive markets may never emit midUpdate, so don't wait for WS.
     this.triggerRequote('startup');
   }
 
   stop(): void {
+    if (this.started) {
+      this.wsManager.off('midUpdate', this.onWsMidUpdate);
+      this.wsManager.off('quoteUpdate', this.onWsQuoteUpdate);
+      this.wsManager.off('connected', this.onWsConnected);
+      this.started = false;
+    }
+    this.resetQuoteProtectionState();
     this.clearRefreshTimer();
     this.clearDriftDebounce();
     this.positionMonitor.stop();
@@ -87,6 +137,7 @@ export class MarketMaker {
   async pause(): Promise<boolean> {
     if (this.paused) return true;
     this.paused = true;
+    this.resetQuoteProtectionState();
     this.clearRefreshTimer();
     this.clearDriftDebounce();
 
@@ -105,6 +156,7 @@ export class MarketMaker {
   pauseForClose(): void {
     if (this.paused) return;
     this.paused = true;
+    this.resetQuoteProtectionState();
     this.clearRefreshTimer();
     this.clearDriftDebounce();
     logger.info(`[${this.shortId}] Paused for close — quoting stopped, WS listener kept`);
@@ -112,6 +164,7 @@ export class MarketMaker {
 
   async pauseForRisk(reason: string): Promise<void> {
     this.paused = true;
+    this.resetQuoteProtectionState();
     this.clearRefreshTimer();
     this.clearDriftDebounce();
 
@@ -130,6 +183,7 @@ export class MarketMaker {
 
   async shutdown(): Promise<{ safeToExit: boolean; reason?: string }> {
     this.paused = true;
+    this.resetQuoteProtectionState();
     this.clearRefreshTimer();
     this.clearDriftDebounce();
 
@@ -162,6 +216,7 @@ export class MarketMaker {
   resume(): void {
     if (!this.paused) return;
     this.paused = false;
+    this.resetQuoteProtectionState();
     logger.info(`[${this.shortId}] Resumed`);
     this.triggerRequote('resume');
   }
@@ -184,6 +239,24 @@ export class MarketMaker {
     }
   }
 
+  private clearQuoteCooldownTimer(): void {
+    if (this.quoteCooldownTimer) {
+      clearTimeout(this.quoteCooldownTimer);
+      this.quoteCooldownTimer = null;
+    }
+  }
+
+  private resetQuoteProtectionState(): void {
+    this.clearQuoteCooldownTimer();
+    this.quoteCooldownUntil = null;
+    this.pendingRequoteAfterCooldown = false;
+    this.protectiveCancelInFlight = false;
+  }
+
+  private isQuoteCooldownActive(): boolean {
+    return this.quoteCooldownUntil !== null && Date.now() < this.quoteCooldownUntil;
+  }
+
   /** Schedule the next refresh after the current requote completes. */
   private scheduleRefresh(): void {
     this.clearRefreshTimer();
@@ -202,6 +275,10 @@ export class MarketMaker {
       logger.debug(`[${this.shortId}] triggerRequote(${reason}): skipped, paused`);
       return;
     }
+    if (this.isQuoteCooldownActive()) {
+      logger.debug(`[${this.shortId}] triggerRequote(${reason}): skipped, cooldown active`);
+      return;
+    }
     if (this.isRequoting) {
       logger.debug(`[${this.shortId}] triggerRequote(${reason}): skipped, already requoting`);
       return;
@@ -210,7 +287,7 @@ export class MarketMaker {
       logger.info(`[${this.shortId}] triggerRequote(${reason}): deferred, close in progress`);
       return;
     }
-    if (this.cancelInFlight) {
+    if (this.cancelInFlight || this.protectiveCancelInFlight) {
       logger.debug(`[${this.shortId}] triggerRequote(${reason}): skipped, cancel in flight`);
       return;
     }
@@ -221,6 +298,44 @@ export class MarketMaker {
     );
   }
 
+  private handleQuoteUpdate(update: QuoteUpdate): void {
+    if (update.tokenId !== this.cfg.yes_token_id && update.tokenId !== this.cfg.no_token_id) {
+      return;
+    }
+
+    const nextState: LiveQuoteState = {
+      bestBid: update.bestBid,
+      bestAsk: update.bestAsk,
+      book: update.book,
+    };
+
+    if (update.tokenId === this.cfg.yes_token_id) {
+      this.yesQuote = nextState;
+      if (update.bestBid !== null && update.bestAsk !== null && update.bestBid < update.bestAsk) {
+        this.cachedMid = (update.bestBid + update.bestAsk) / 2;
+        this.cachedMidUpdatedAt = Date.now();
+      }
+    } else {
+      this.noQuote = nextState;
+    }
+
+    const proximityReason = this.getProximityReason();
+    if (proximityReason) {
+      this.beginProtectiveCooldown(proximityReason).catch(err =>
+        logger.error(`[${this.shortId}] protective cooldown (${proximityReason}) error:`, err)
+      );
+      return;
+    }
+
+    if (
+      this.pendingRequoteAfterCooldown &&
+      !this.hasActiveOrders &&
+      !this.isQuoteCooldownActive()
+    ) {
+      this.triggerRequote('quote-update-after-cooldown');
+    }
+  }
+
   private onMidUpdate(newMid: number): void {
     // First update ever: requote immediately (no orders to cancel yet)
     if (this.lastQuotedMid === null) {
@@ -229,34 +344,94 @@ export class MarketMaker {
       return;
     }
 
-    // Drift check
     const drift = Math.abs(newMid - this.lastQuotedMid);
     const threshold = this.cfg.fallback_v * this.cfg.drift_threshold_factor;
     if (drift <= threshold) return;
 
-    // Price has drifted — cancel orders immediately (once), then debounce the requote
     if (this.hasActiveOrders) {
       logger.info(
-        `[${this.shortId}] onMidUpdate: drift=${drift.toFixed(4)} > threshold=${threshold.toFixed(4)}, ` +
-        `cancelling orders, debouncing requote`
+        `[${this.shortId}] onMidUpdate: drift=${drift.toFixed(4)} > threshold=${threshold.toFixed(4)}, entering cooldown`
       );
-      this.cancelOrders('drift').catch(err =>
-        logger.error(`[${this.shortId}] cancelOrders (drift) error:`, err)
+      this.beginProtectiveCooldown('drift').catch(err =>
+        logger.error(`[${this.shortId}] protective cooldown (drift) error:`, err)
       );
-    } else {
-      logger.debug(
-        `[${this.shortId}] onMidUpdate: drift=${drift.toFixed(4)} > threshold=${threshold.toFixed(4)}, ` +
-        `resetting debounce (no active orders)`
-      );
+      return;
     }
 
-    // Reset debounce timer — requote fires 3s after the last drift event
+    logger.debug(
+      `[${this.shortId}] onMidUpdate: drift=${drift.toFixed(4)} > threshold=${threshold.toFixed(4)}, ` +
+      `resetting debounce (no active orders)`
+    );
+
     this.clearDriftDebounce();
     this.clearRefreshTimer();
     this.driftDebounceTimer = setTimeout(() => {
       this.driftDebounceTimer = null;
       this.triggerDriftRequoteWhenReady();
-    }, 3000);
+    }, DRIFT_REQUOTE_DEBOUNCE_MS);
+  }
+
+  private getProximityReason(): string | null {
+    if (!this.hasActiveOrders || this.activeQuoteState === null) return null;
+    if (this.isQuoteCooldownActive() || this.pendingRequoteAfterCooldown || this.protectiveCancelInFlight) {
+      return null;
+    }
+
+    const { yesBid, noBid, tickSize } = this.activeQuoteState;
+    const yesQuote = this.yesQuote;
+    const noQuote = this.noQuote;
+
+    if (
+      yesBid !== null &&
+      yesQuote !== null &&
+      yesQuote.bestAsk !== null &&
+      yesQuote.bestAsk - yesBid <= tickSize + FLOAT_EPSILON
+    ) {
+      return 'proximity-yes';
+    }
+
+    if (
+      noBid !== null &&
+      noQuote !== null &&
+      noQuote.bestAsk !== null &&
+      noQuote.bestAsk - noBid <= tickSize + FLOAT_EPSILON
+    ) {
+      return 'proximity-no';
+    }
+
+    return null;
+  }
+
+  private async beginProtectiveCooldown(reason: string): Promise<void> {
+    if (this.paused || !this.hasActiveOrders || this.protectiveCancelInFlight) {
+      return;
+    }
+
+    this.protectiveCancelInFlight = true;
+    this.clearRefreshTimer();
+    this.clearDriftDebounce();
+
+    try {
+      const cancelled = await this.cancelOrders(reason);
+      if (!cancelled) {
+        logger.warn(`[${this.shortId}] ${reason}: protective cancel failed, leaving orders live`);
+        return;
+      }
+
+      this.pendingRequoteAfterCooldown = true;
+      this.quoteCooldownUntil = Date.now() + QUOTE_COOLDOWN_MS;
+      this.clearQuoteCooldownTimer();
+      this.quoteCooldownTimer = setTimeout(() => {
+        this.quoteCooldownTimer = null;
+        this.quoteCooldownUntil = null;
+        if (!this.pendingRequoteAfterCooldown || this.paused) return;
+        this.triggerRequote('cooldown-elapsed');
+      }, QUOTE_COOLDOWN_MS);
+
+      logger.info(`[${this.shortId}] ${reason}: cooldown started for ${QUOTE_COOLDOWN_MS}ms`);
+    } finally {
+      this.protectiveCancelInFlight = false;
+    }
   }
 
   private async requote(reason: string): Promise<void> {
@@ -278,17 +453,24 @@ export class MarketMaker {
       // 3. Calculate spread: s = v * spread_factor
       const s = v * this.cfg.spread_factor;
 
-      // 5. Calculate prices:
+      // 4. Calculate prices:
       //    BUY YES @ (mid - s)
       //    BUY NO  @ (1 - (mid + s))
       //    Both consume USDC — no token inventory required.
       const yesBid = roundDownToTick(mid - s, tick_size);
       const noPrice = roundDownToTick(1 - (mid + s), tick_size);
 
-      // Sanity check
       if (yesBid <= 0 || yesBid >= 1 || noPrice <= 0 || noPrice >= 1) {
         logger.warn(`[${this.shortId}] requote(${reason}): invalid prices yesBid=${yesBid} noPrice=${noPrice}, skipping`);
         return;
+      }
+
+      if (this.pendingRequoteAfterCooldown) {
+        const guard = this.canRequoteAfterCooldown(yesBid, noPrice, v, tick_size);
+        if (!guard.ok) {
+          logger.info(`[${this.shortId}] requote(${reason}): cooldown gate blocked (${guard.reason})`);
+          return;
+        }
       }
 
       logger.info(
@@ -296,14 +478,18 @@ export class MarketMaker {
         `BUY YES@${yesBid} BUY NO@${noPrice}`
       );
 
-      // 6. Cancel existing orders
+      // 5. Cancel existing orders
       const cancelled = await this.cancelOrders(`requote:${reason}`);
       if (!cancelled) {
         logger.warn(`[${this.shortId}] requote(${reason}): cancel failed, skipping placement`);
         return;
       }
+      if (this.isQuoteCooldownActive()) {
+        logger.info(`[${this.shortId}] requote(${reason}): protective cooldown took over after cancel`);
+        return;
+      }
 
-      // 7. Place new orders: BUY YES + BUY NO (both use USDC as collateral)
+      // 6. Place new orders: BUY YES + BUY NO (both use USDC as collateral)
       const [yesBidId, noBidId] = await Promise.all([
         placeLimitOrder('BUY', yesBid, this.cfg.min_size, this.cfg.yes_token_id),
         placeLimitOrder('BUY', noPrice, this.cfg.min_size, this.cfg.no_token_id),
@@ -316,7 +502,7 @@ export class MarketMaker {
         );
       }
 
-      // 8. Track orders for fill detection
+      // 7. Track orders for fill detection
       const tracked: TrackedOrder[] = [];
       if (yesBidId && yesBidId !== 'unknown') {
         tracked.push({ orderId: yesBidId, tokenId: this.cfg.yes_token_id, side: 'BUY', price: yesBid, size: this.cfg.min_size });
@@ -326,14 +512,92 @@ export class MarketMaker {
       }
       this.positionMonitor.trackOrders(tracked);
       this.hasActiveOrders = tracked.length > 0;
+      this.activeQuoteState = tracked.length > 0
+        ? {
+          yesBid: yesBidId && yesBidId !== 'unknown' ? yesBid : null,
+          noBid: noBidId && noBidId !== 'unknown' ? noPrice : null,
+          tickSize: tick_size,
+        }
+        : null;
 
-      // 9. Update last quoted mid
-      this.lastQuotedMid = mid;
+      if (this.hasActiveOrders) {
+        this.pendingRequoteAfterCooldown = false;
+        this.lastQuotedMid = mid;
+      }
     } finally {
       this.isRequoting = false;
       // Always schedule next refresh after requote completes (success or failure)
       this.scheduleRefresh();
     }
+  }
+
+  private canRequoteAfterCooldown(
+    yesBid: number,
+    noBid: number,
+    v: number,
+    tickSize: number,
+  ): RequoteGuardResult {
+    const yesCheck = this.checkRewardBandSide('YES', this.yesQuote, yesBid, v, tickSize);
+    if (!yesCheck.ok) return yesCheck;
+
+    const noCheck = this.checkRewardBandSide('NO', this.noQuote, noBid, v, tickSize);
+    if (!noCheck.ok) return noCheck;
+
+    return { ok: true };
+  }
+
+  private checkRewardBandSide(
+    label: 'YES' | 'NO',
+    quote: LiveQuoteState | null,
+    candidateBid: number,
+    v: number,
+    tickSize: number,
+  ): RequoteGuardResult {
+    if (quote?.book === null || quote === null) {
+      return { ok: false, reason: `${label.toLowerCase()}-book-missing` };
+    }
+    if (
+      quote.bestBid === null ||
+      quote.bestAsk === null ||
+      quote.bestBid <= 0 ||
+      quote.bestAsk <= 0 ||
+      quote.bestBid >= quote.bestAsk
+    ) {
+      return { ok: false, reason: `${label.toLowerCase()}-quotes-invalid` };
+    }
+
+    const spread = quote.bestAsk - quote.bestBid;
+    const maxAllowedSpread = Math.min(v, MAX_REQUOTE_SPREAD);
+    if (spread + FLOAT_EPSILON < tickSize) {
+      return { ok: false, reason: `${label.toLowerCase()}-spread-too-tight` };
+    }
+    if (spread - FLOAT_EPSILON > maxAllowedSpread) {
+      return { ok: false, reason: `${label.toLowerCase()}-spread-too-wide` };
+    }
+
+    const mid = (quote.bestBid + quote.bestAsk) / 2;
+    const rewardLowerBound = mid - v;
+    if (candidateBid + FLOAT_EPSILON < rewardLowerBound || candidateBid - FLOAT_EPSILON > mid) {
+      return { ok: false, reason: `${label.toLowerCase()}-quote-outside-band` };
+    }
+
+    const depthWithinBand = this.sumBidDepthWithinBand(quote.book, rewardLowerBound);
+    if (depthWithinBand + FLOAT_EPSILON < this.cfg.min_size * REQUOTE_BAND_DEPTH_MULTIPLIER) {
+      return { ok: false, reason: `${label.toLowerCase()}-band-depth-too-low` };
+    }
+
+    return { ok: true };
+  }
+
+  private sumBidDepthWithinBand(book: OrderBook, rewardLowerBound: number): number {
+    return book.bids.reduce((total, level) => {
+      const price = parseFloat(level.price);
+      const size = parseFloat(level.size);
+      if (!Number.isFinite(price) || !Number.isFinite(size) || price + FLOAT_EPSILON < rewardLowerBound) {
+        return total;
+      }
+      return total + size;
+    }, 0);
   }
 
   private async cancelOrders(reason: string): Promise<boolean> {
@@ -351,6 +615,7 @@ export class MarketMaker {
       }
 
       this.hasActiveOrders = false;
+      this.activeQuoteState = null;
       if (!this.positionMonitor.isClosing()) {
         this.positionMonitor.stopTracking();
       }
@@ -364,11 +629,11 @@ export class MarketMaker {
   }
 
   private triggerDriftRequoteWhenReady(): void {
-    if (this.cancelInFlight) {
+    if (this.cancelInFlight || this.protectiveCancelInFlight) {
       this.driftDebounceTimer = setTimeout(() => {
         this.driftDebounceTimer = null;
         this.triggerDriftRequoteWhenReady();
-      }, 250);
+      }, DRIFT_REQUOTE_RETRY_MS);
       return;
     }
 

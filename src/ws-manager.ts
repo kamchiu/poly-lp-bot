@@ -2,6 +2,8 @@ import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { HttpsProxyAgent } = require('https-proxy-agent');
+import { OrderBook, OrderBookLevel, QuoteUpdate } from './types';
+import { applyBookDelta } from './utils';
 import logger from './logger';
 
 const WS_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -11,6 +13,7 @@ const WS_MAX_RECONNECT_DELAY_MS = 60_000;
 export class WsManager extends EventEmitter {
   private ws: WebSocket | null = null;
   private tokenIds: string[] = [];
+  private books = new Map<string, OrderBook>();
   private reconnectAttempt = 0;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private staleTimer: NodeJS.Timeout | null = null;
@@ -47,6 +50,7 @@ export class WsManager extends EventEmitter {
       this.ws.removeAllListeners();
       this.ws.terminate();
     }
+    this.books.clear();
 
     logger.info(`[WS] Connecting (attempt=${this.reconnectAttempt})...`);
     const proxyUrl = process.env.https_proxy ?? process.env.HTTPS_PROXY ?? process.env.http_proxy ?? process.env.HTTP_PROXY;
@@ -118,7 +122,16 @@ export class WsManager extends EventEmitter {
     //    { market, price_changes: [{ asset_id, side, price, size, best_bid, best_ask }] }
 
     if (Array.isArray(msg)) {
-      // Shape 1: snapshot — subscription confirmed, discard for mid purposes
+      // Shape 1: snapshot — seed local book state for later incremental updates
+      for (const snapshot of msg) {
+        const tokenId = typeof snapshot?.asset_id === 'string' ? snapshot.asset_id : null;
+        if (!tokenId) continue;
+
+        this.books.set(tokenId, {
+          bids: normalizeLevels(snapshot.bids, 'BUY'),
+          asks: normalizeLevels(snapshot.asks, 'SELL'),
+        });
+      }
       return;
     }
 
@@ -127,9 +140,27 @@ export class WsManager extends EventEmitter {
       for (const change of msg.price_changes) {
         const tokenId: string = change.asset_id;
         if (!tokenId) continue;
-        const bestBid = parseFloat(change.best_bid);
-        const bestAsk = parseFloat(change.best_ask);
-        if (isFinite(bestBid) && isFinite(bestAsk) && bestBid > 0 && bestAsk > 0 && bestBid < bestAsk) {
+        const bestBid = parsePositiveNumber(change.best_bid);
+        const bestAsk = parsePositiveNumber(change.best_ask);
+
+        const existingBook = this.books.get(tokenId) ?? { bids: [], asks: [] };
+        const deltaSide = change.side === 'BUY'
+          ? { bids: normalizeLevels([{ price: change.price, size: change.size }], 'BUY') }
+          : change.side === 'SELL'
+            ? { asks: normalizeLevels([{ price: change.price, size: change.size }], 'SELL') }
+            : {};
+        const nextBook = sortBook(applyBookDelta(existingBook, deltaSide));
+        this.books.set(tokenId, nextBook);
+
+        const quoteUpdate: QuoteUpdate = {
+          tokenId,
+          bestBid,
+          bestAsk,
+          book: nextBook,
+        };
+        this.emit('quoteUpdate', quoteUpdate);
+
+        if (bestBid !== null && bestAsk !== null && bestBid < bestAsk) {
           const mid = (bestBid + bestAsk) / 2;
           this.emit('midUpdate', tokenId, mid);
         }
@@ -177,4 +208,45 @@ export class WsManager extends EventEmitter {
       this.staleTimer = null;
     }
   }
+}
+
+function normalizeLevels(levels: any, side: 'BUY' | 'SELL'): OrderBookLevel[] {
+  if (!Array.isArray(levels)) return [];
+
+  const normalized: OrderBookLevel[] = [];
+  for (const level of levels) {
+    const price = normalizeNumericString(level?.price);
+    const size = normalizeNumericString(level?.size);
+    if (price === null || size === null) continue;
+    normalized.push({ price, size });
+  }
+
+  return sortLevels(normalized, side);
+}
+
+function sortBook(book: OrderBook): OrderBook {
+  return {
+    bids: sortLevels(book.bids, 'BUY'),
+    asks: sortLevels(book.asks, 'SELL'),
+  };
+}
+
+function sortLevels(levels: OrderBookLevel[], side: 'BUY' | 'SELL'): OrderBookLevel[] {
+  return [...levels].sort((left, right) => {
+    const leftPrice = parseFloat(left.price);
+    const rightPrice = parseFloat(right.price);
+    return side === 'BUY' ? rightPrice - leftPrice : leftPrice - rightPrice;
+  });
+}
+
+function normalizeNumericString(value: unknown): string | null {
+  const parsed = parseFloat(String(value));
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed.toString();
+}
+
+function parsePositiveNumber(value: unknown): number | null {
+  const parsed = parseFloat(String(value));
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
 }

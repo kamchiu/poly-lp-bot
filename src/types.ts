@@ -41,6 +41,13 @@ export interface OrderBook {
   asks: OrderBookLevel[];
 }
 
+export interface QuoteUpdate {
+  tokenId: string;
+  bestBid: number | null;
+  bestAsk: number | null;
+  book: OrderBook | null;
+}
+
 /** Tracked order placed by MarketMaker, used by PositionMonitor for fill detection. */
 export interface TrackedOrder {
   orderId: string;
