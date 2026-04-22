@@ -30,13 +30,6 @@ const MAX_DAILY_RATE = 1500;
 const MAX_MIN_SHARES = 50;
 
 /**
- * Rewards start_date filter. Set to -1 to use today's date (UTC).
- * Only markets whose rewards_config start_date is AFTER this date pass.
- * Format: "YYYY-MM-DD" or -1.
- */
-const MIN_START_DATE: string | -1 = -1;
-
-/**
  * 24-hour volume range (USD). Too low → thin book, snipe risk. Too high → hot/volatile market.
  */
 const MIN_VOLUME_24H = 800;
@@ -264,7 +257,6 @@ export function isNearCatalyst(
  */
 export function scoreMarket(
   reward: MarketReward,
-  thresholdDate: Date,
   aggregateDailyRate: number,
   now: Date = new Date()
 ): ScoredMarket | null {
@@ -284,13 +276,6 @@ export function scoreMarket(
   // --- Filter: current spread must be within the rewards band ---
   if (reward.spread !== undefined) {
     if (reward.spread > reward.rewards_max_spread / 100) return null;
-  }
-
-  // --- Filter: start_date must be after the configured threshold date ---
-  const startDateStr = reward.rewards_config?.[0]?.start_date;
-  if (startDateStr) {
-    const startDate = new Date(startDateStr);
-    if (!isNaN(startDate.getTime()) && startDate <= thresholdDate) return null;
   }
 
   // --- Filter: 24h volume ---
@@ -384,25 +369,10 @@ async function main() {
   const countIdx = args.indexOf('--count');
   const count = countIdx !== -1 ? parseInt(args[countIdx + 1], 10) : DEFAULT_COUNT;
 
-  // Resolve threshold date: CLI --start-date overrides constant; -1 → today UTC
-  const startDateIdx = args.indexOf('--start-date');
-  const startDateArg = startDateIdx !== -1 ? args[startDateIdx + 1] : MIN_START_DATE;
-  let thresholdDate: Date;
-  if (startDateArg === -1 || startDateArg === '-1') {
-    const t = new Date();
-    thresholdDate = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate()));
-  } else {
-    thresholdDate = new Date(startDateArg as string);
-    if (isNaN(thresholdDate.getTime())) {
-      console.error(`Invalid --start-date value: ${startDateArg}`);
-      process.exit(1);
-    }
-  }
-
   console.log('=== Polymarket LP Market Scanner ===');
   console.log(
     `Filters: daily_rate=${MIN_DAILY_RATE}–${MAX_DAILY_RATE} USDC/day | ` +
-    `min_size≤${MAX_MIN_SHARES} | start_date>${thresholdDate.toISOString().slice(0, 10)} | ` +
+    `min_size≤${MAX_MIN_SHARES} | ` +
     `vol_24h=${MIN_VOLUME_24H.toLocaleString()}–${MAX_VOLUME_24H.toLocaleString()} | ` +
     `competitiveness≤${MAX_COMPETITIVENESS} | spread≤rewards_max_spread | ` +
     `days_to_event≥${MIN_DAYS_TO_EVENT}`
@@ -473,11 +443,11 @@ async function main() {
   }
   console.log(`Unique underlying tokens: ${tokenGroups.size}`);
 
-  // 5. Score all groups — all filters applied here (rate, competitiveness, start_date, volume, mid).
+  // 5. Score all groups — all filters applied here (rate, competitiveness, volume, mid).
   const now = new Date();
   const scored: ScoredMarket[] = [];
   for (const { representative: entry, totalRate } of tokenGroups.values()) {
-    const result = scoreMarket(entry.reward, thresholdDate, totalRate, now);
+    const result = scoreMarket(entry.reward, totalRate, now);
     if (result !== null) scored.push(result);
   }
   console.log(`After all filters: ${scored.length} market(s) pass`);
@@ -493,18 +463,17 @@ async function main() {
 
   // 7. Print summary table
   console.log('\nSelected markets:');
-  console.log('  #  Score   Rate/day  Compet   D/Event  StartDate   Mid    Question');
-  console.log('  -- ------  --------  -------  -------  ----------  -----  --------');
+  console.log('  #  Score   Rate/day  Compet   D/Event   Mid    Question');
+  console.log('  -- ------  --------  -------  -------  -----  --------');
   for (let i = 0; i < selected.length; i++) {
     const s = selected[i];
-    const startDate = s.reward.rewards_config?.[0]?.start_date?.slice(0, 10) ?? 'unknown';
     const daysToEvent = getDaysToEvent(s.reward, now);
     const daysToEventText = daysToEvent === null ? 'n/a' : Math.ceil(daysToEvent).toString();
     const question = (s.reward.question ?? '').slice(0, 55);
     console.log(
       `  ${String(i + 1).padStart(2)}  ${s.score.toFixed(1).padStart(6)}  ` +
       `$${s.dailyRate.toFixed(0).padStart(7)}  ${s.competitiveness.toFixed(1).padStart(7)}  ` +
-      `${daysToEventText.padStart(7)}  ${startDate}  ${s.mid.toFixed(2)}   ${question}`
+      `${daysToEventText.padStart(7)}  ${s.mid.toFixed(2)}   ${question}`
     );
   }
 

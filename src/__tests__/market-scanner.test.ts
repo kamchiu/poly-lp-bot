@@ -93,7 +93,6 @@ describe('market-scanner catalyst filter', () => {
     expect(
       scoreMarket(
         reward,
-        new Date('2026-04-01T00:00:00Z'),
         100,
         new Date('2026-04-22T00:00:00Z'),
       )
