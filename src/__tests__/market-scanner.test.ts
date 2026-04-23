@@ -75,6 +75,21 @@ describe('market-scanner manual filters', () => {
 });
 
 describe('market-scanner catalyst filter', () => {
+  it('does not reject a market only because the current spread exceeds rewards_max_spread', () => {
+    const reward = buildReward({
+      spread: 0.06,
+      rewards_max_spread: 4.5,
+    });
+
+    expect(
+      scoreMarket(
+        reward,
+        100,
+        new Date('2026-04-22T00:00:00Z'),
+      )
+    ).not.toBeNull();
+  });
+
   it('rejects markets whose event date is too close', () => {
     const reward = buildReward({
       end_date: '2026-04-30T00:00:00Z',

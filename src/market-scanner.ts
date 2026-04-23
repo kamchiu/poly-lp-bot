@@ -273,11 +273,6 @@ export function scoreMarket(
   // --- Filter: competitiveness ---
   if (reward.market_competitiveness > MAX_COMPETITIVENESS) return null;
 
-  // --- Filter: current spread must be within the rewards band ---
-  if (reward.spread !== undefined) {
-    if (reward.spread > reward.rewards_max_spread / 100) return null;
-  }
-
   // --- Filter: 24h volume ---
   if (reward.volume_24hr < MIN_VOLUME_24H || reward.volume_24hr > MAX_VOLUME_24H) return null;
 
@@ -374,7 +369,7 @@ async function main() {
     `Filters: daily_rate=${MIN_DAILY_RATE}–${MAX_DAILY_RATE} USDC/day | ` +
     `min_size≤${MAX_MIN_SHARES} | ` +
     `vol_24h=${MIN_VOLUME_24H.toLocaleString()}–${MAX_VOLUME_24H.toLocaleString()} | ` +
-    `competitiveness≤${MAX_COMPETITIVENESS} | spread≤rewards_max_spread | ` +
+    `competitiveness≤${MAX_COMPETITIVENESS} | ` +
     `days_to_event≥${MIN_DAYS_TO_EVENT}`
   );
   if (WHITELIST_SLUGS.length > 0 || WHITELIST_KEYWORDS.length > 0) {
