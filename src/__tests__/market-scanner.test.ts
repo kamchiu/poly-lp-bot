@@ -75,6 +75,34 @@ describe('market-scanner manual filters', () => {
 });
 
 describe('market-scanner catalyst filter', () => {
+  it('scores markets by daily rate per min_size with a competitiveness penalty', () => {
+    const reward = buildReward({
+      rewards_min_size: 25,
+      market_competitiveness: 4,
+    });
+
+    const scored = scoreMarket(
+      reward,
+      250,
+      new Date('2026-04-22T00:00:00Z'),
+    );
+
+    expect(scored).not.toBeNull();
+    expect(scored?.score).toBeCloseTo((250 / 25) * (1 / (1 + 4)));
+  });
+
+  it('rejects markets with non-positive min_size', () => {
+    const reward = buildReward({ rewards_min_size: 0 });
+
+    expect(
+      scoreMarket(
+        reward,
+        100,
+        new Date('2026-04-22T00:00:00Z'),
+      )
+    ).toBeNull();
+  });
+
   it('does not reject a market only because the current spread exceeds rewards_max_spread', () => {
     const reward = buildReward({
       spread: 0.06,
