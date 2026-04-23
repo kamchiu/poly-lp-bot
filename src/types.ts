@@ -4,8 +4,8 @@ export interface MarketConfig {
   condition_id?: string;
   yes_token_id?: string;
   no_token_id?: string;
-  min_size: number;
-  fallback_v: number;
+  min_size?: number;
+  fallback_v?: number;
   // optional per-market overrides
   spread_factor?: number;
   refresh_interval_ms?: number;
@@ -14,6 +14,8 @@ export interface MarketConfig {
 }
 
 export interface Defaults {
+  min_size: number;
+  fallback_v: number;
   spread_factor: number;
   refresh_interval_ms: number;
   drift_threshold_factor: number;

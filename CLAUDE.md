@@ -20,7 +20,7 @@ There is no test suite or linter configured.
 
 ```bash
 cp .env.example .env        # Fill in PRIVATE_KEY, CHAIN_ID, CLOB_HOST
-# Edit config.yaml with real condition_id and yes_token_id values
+# Edit config.yaml with Polymarket market URLs (preferred) or explicit market IDs
 npm install
 npm run dev
 ```
@@ -54,7 +54,7 @@ client.ts (module-level singleton)
 
 **`MarketMaker.requote()`** is the single authoritative path for order placement. The WS `onMidUpdate` path is rate-limited by `min_requote_interval_ms` and gated by a drift threshold (`|newMid - lastQuotedMid| > v × drift_threshold_factor`). When mid is outside `[min_mid_price, max_mid_price]`, existing orders are cancelled and no new ones are placed.
 
-**`config.yaml`** has a `defaults` block and a `markets` array. Any field in `defaults` can be overridden per-market. `resolveMarketConfig()` in `config.ts` merges these into a `ResolvedMarketConfig` (all fields required).
+**`config.yaml`** has a `defaults` block and a `markets` array. The recommended setup is to put shared values like `min_size`, `fallback_v`, and timing knobs in `defaults`, then list markets by `url`. `resolveMarketIds()` fills in token/condition IDs from the URL, and `resolveMarketConfig()` merges defaults with any per-market overrides into a `ResolvedMarketConfig`.
 
 ### `@polymarket/clob-client` notes
 

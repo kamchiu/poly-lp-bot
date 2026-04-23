@@ -35,21 +35,49 @@ export function loadConfig(path: string): AppConfig {
 
 /**
  * Extract slugs from a Polymarket URL.
- * Handles: /event/<eventSlug>/<marketSlug>, /event/<slug>, /market/<slug>
+ * Handles:
+ *   /event/<eventSlug>/<marketSlug>
+ *   /<locale>/event/<eventSlug>/<marketSlug>
+ *   /event/<slug>
+ *   /market/<slug>
+ *   /<locale>/market/<slug>
  * Returns { eventSlug, marketSlug } — marketSlug may be undefined.
  */
 function extractSlugs(url: string): { eventSlug: string; marketSlug?: string } {
-  // /event/<eventSlug>/<marketSlug>
-  const eventMatch = url.match(/polymarket\.com\/event\/([^/?#]+)(?:\/([^/?#]+))?/);
-  if (eventMatch) {
-    return { eventSlug: eventMatch[1], marketSlug: eventMatch[2] };
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`Cannot extract slug from URL: ${url}`);
   }
-  // /market/<slug>
-  const marketMatch = url.match(/polymarket\.com\/market\/([^/?#]+)/);
-  if (marketMatch) {
-    return { eventSlug: marketMatch[1] };
+
+  if (!/(^|\.)polymarket\.com$/i.test(parsed.hostname)) {
+    throw new Error(`Cannot extract slug from URL: ${url}`);
   }
-  throw new Error(`Cannot extract slug from URL: ${url}`);
+
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  const routeIndex =
+    segments[0] === 'event' || segments[0] === 'market'
+      ? 0
+      : segments[1] === 'event' || segments[1] === 'market'
+        ? 1
+        : -1;
+
+  if (routeIndex === -1) {
+    throw new Error(`Cannot extract slug from URL: ${url}`);
+  }
+
+  const route = segments[routeIndex];
+  const primarySlug = segments[routeIndex + 1];
+  if (!primarySlug) {
+    throw new Error(`Cannot extract slug from URL: ${url}`);
+  }
+
+  if (route === 'event') {
+    return { eventSlug: primarySlug, marketSlug: segments[routeIndex + 2] };
+  }
+
+  return { eventSlug: primarySlug };
 }
 
 interface GammaMarket {
@@ -116,11 +144,14 @@ async function resolveIdsFromUrl(url: string): Promise<{ condition_id: string; y
 }
 
 /**
- * Fill in condition_id and yes_token_id for any market entries that specify a URL.
+ * Fill in condition_id, yes_token_id, and no_token_id for any market entries
+ * that specify a URL.
  * Mutates the MarketConfig objects in place.
  */
 export async function resolveMarketIds(markets: MarketConfig[]): Promise<void> {
-  const pending = markets.filter(m => m.url && (!m.condition_id || !m.yes_token_id));
+  const pending = markets.filter(m =>
+    m.url && (!m.condition_id || !m.yes_token_id || !m.no_token_id)
+  );
   if (pending.length === 0) return;
 
   logger.info(`[Config] Resolving IDs for ${pending.length} market(s) from Polymarket URLs...`);
@@ -150,12 +181,29 @@ export function resolveMarketConfig(
       `Provide it directly in config.yaml or via a "url" field (resolved automatically).`
     );
   }
+
+  const minSize = market.min_size ?? defaults.min_size;
+  if (minSize === undefined) {
+    throw new Error(
+      `Market is missing min_size. ` +
+      `Provide it directly in config.yaml or via defaults.min_size.`
+    );
+  }
+
+  const fallbackV = market.fallback_v ?? defaults.fallback_v;
+  if (fallbackV === undefined) {
+    throw new Error(
+      `Market is missing fallback_v. ` +
+      `Provide it directly in config.yaml or via defaults.fallback_v.`
+    );
+  }
+
   return {
     condition_id: market.condition_id,
     yes_token_id: market.yes_token_id,
     no_token_id: market.no_token_id,
-    min_size: market.min_size,
-    fallback_v: market.fallback_v,
+    min_size: minSize,
+    fallback_v: fallbackV,
     spread_factor: market.spread_factor ?? defaults.spread_factor,
     refresh_interval_ms: market.refresh_interval_ms ?? defaults.refresh_interval_ms,
     drift_threshold_factor: market.drift_threshold_factor ?? defaults.drift_threshold_factor,
