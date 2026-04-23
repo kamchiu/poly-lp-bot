@@ -490,32 +490,44 @@ export class MarketMaker {
       }
 
       // 6. Place new orders: BUY YES + BUY NO (both use USDC as collateral)
-      const [yesBidId, noBidId] = await Promise.all([
+      const [yesBidOrder, noBidOrder] = await Promise.all([
         placeLimitOrder('BUY', yesBid, this.cfg.min_size, this.cfg.yes_token_id),
         placeLimitOrder('BUY', noPrice, this.cfg.min_size, this.cfg.no_token_id),
       ]);
 
-      if (!yesBidId || !noBidId) {
+      if (!yesBidOrder || !noBidOrder) {
         logger.warn(
           `[${this.shortId}] requote(${reason}): placement incomplete — ` +
-          `BUY YES=${yesBidId ?? 'FAILED'} BUY NO=${noBidId ?? 'FAILED'}`
+          `BUY YES=${yesBidOrder?.orderId ?? 'FAILED'} BUY NO=${noBidOrder?.orderId ?? 'FAILED'}`
         );
       }
 
       // 7. Track orders for fill detection
       const tracked: TrackedOrder[] = [];
-      if (yesBidId && yesBidId !== 'unknown') {
-        tracked.push({ orderId: yesBidId, tokenId: this.cfg.yes_token_id, side: 'BUY', price: yesBid, size: this.cfg.min_size });
+      if (yesBidOrder) {
+        tracked.push({
+          orderId: yesBidOrder.orderId,
+          tokenId: this.cfg.yes_token_id,
+          side: 'BUY',
+          price: yesBid,
+          size: this.cfg.min_size,
+        });
       }
-      if (noBidId && noBidId !== 'unknown') {
-        tracked.push({ orderId: noBidId, tokenId: this.cfg.no_token_id, side: 'BUY', price: noPrice, size: this.cfg.min_size });
+      if (noBidOrder) {
+        tracked.push({
+          orderId: noBidOrder.orderId,
+          tokenId: this.cfg.no_token_id,
+          side: 'BUY',
+          price: noPrice,
+          size: this.cfg.min_size,
+        });
       }
       this.positionMonitor.trackOrders(tracked);
       this.hasActiveOrders = tracked.length > 0;
       this.activeQuoteState = tracked.length > 0
         ? {
-          yesBid: yesBidId && yesBidId !== 'unknown' ? yesBid : null,
-          noBid: noBidId && noBidId !== 'unknown' ? noPrice : null,
+          yesBid: yesBidOrder ? yesBid : null,
+          noBid: noBidOrder ? noPrice : null,
           tickSize: tick_size,
         }
         : null;
@@ -608,12 +620,18 @@ export class MarketMaker {
 
     this.cancelInFlight = true;
     this.cancelPromise = (async () => {
+      logger.info(
+        `[${this.shortId}] cancelOrders(${reason}) start hasActive=${this.hasActiveOrders} ` +
+        `closing=${this.positionMonitor.isClosing()}`
+      );
       const cancelled = await cancelMarketOrders(this.cfg.condition_id);
       if (!cancelled) {
         logger.warn(`[${this.shortId}] cancelOrders(${reason}) failed`);
         return false;
       }
 
+      logger.info(`[${this.shortId}] cancelOrders(${reason}) confirmed — source=reconcile:market-maker:${reason}`);
+      await this.positionMonitor.reconcileTrackedOrders(`market-maker:${reason}`);
       this.hasActiveOrders = false;
       this.activeQuoteState = null;
       if (!this.positionMonitor.isClosing()) {

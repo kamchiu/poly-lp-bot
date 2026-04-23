@@ -1,10 +1,12 @@
 import { EventEmitter } from 'events';
 import { PositionMonitor } from '../position-monitor';
 import type { UserWsManager } from '../user-ws-manager';
+import logger from '../logger';
 import {
   cancelMarketOrders,
   cancelOrder,
   getBestBidAsk,
+  getOrderStatus,
   getMarketInfo,
   placeLimitOrder,
   getTokenBalance,
@@ -14,6 +16,7 @@ jest.mock('../client', () => ({
   cancelMarketOrders: jest.fn(),
   cancelOrder: jest.fn(),
   getBestBidAsk: jest.fn(),
+  getOrderStatus: jest.fn(),
   getMarketInfo: jest.fn(),
   placeLimitOrder: jest.fn(),
   getTokenBalance: jest.fn(),
@@ -39,12 +42,32 @@ jest.mock('../logger', () => ({
 const cancelMarketOrdersMock = cancelMarketOrders as jest.MockedFunction<typeof cancelMarketOrders>;
 const cancelOrderMock = cancelOrder as jest.MockedFunction<typeof cancelOrder>;
 const getBestBidAskMock = getBestBidAsk as jest.MockedFunction<typeof getBestBidAsk>;
+const getOrderStatusMock = getOrderStatus as jest.MockedFunction<typeof getOrderStatus>;
 const getMarketInfoMock = getMarketInfo as jest.MockedFunction<typeof getMarketInfo>;
 const placeLimitOrderMock = placeLimitOrder as jest.MockedFunction<typeof placeLimitOrder>;
 const getTokenBalanceMock = getTokenBalance as jest.MockedFunction<typeof getTokenBalance>;
 
 const CONDITION_ID = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const TOKEN_ID = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const loggerMock = logger as unknown as {
+  info: jest.Mock;
+  warn: jest.Mock;
+  error: jest.Mock;
+  debug: jest.Mock;
+};
+
+const buildPlacedOrder = (
+  orderId: string,
+  overrides: Partial<NonNullable<Awaited<ReturnType<typeof placeLimitOrder>>>> = {},
+): NonNullable<Awaited<ReturnType<typeof placeLimitOrder>>> => ({
+  orderId,
+  status: 'live',
+  price: 0.4,
+  size: 20,
+  tokenId: TOKEN_ID,
+  side: 'SELL',
+  ...overrides,
+});
 
 const flushPromises = async (): Promise<void> => {
   await new Promise<void>(resolve => process.nextTick(resolve));
@@ -57,6 +80,7 @@ describe('PositionMonitor', () => {
     cancelMarketOrdersMock.mockReset();
     cancelOrderMock.mockReset();
     getBestBidAskMock.mockReset();
+    getOrderStatusMock.mockReset();
     getMarketInfoMock.mockReset();
     placeLimitOrderMock.mockReset();
     getTokenBalanceMock.mockReset();
@@ -154,8 +178,8 @@ describe('PositionMonitor', () => {
       .mockResolvedValueOnce({ bestBid: 0.39, bestAsk: 0.41 })
       .mockResolvedValueOnce({ bestBid: 0.37, bestAsk: 0.38 });
     placeLimitOrderMock
-      .mockResolvedValueOnce('close-order-1')
-      .mockResolvedValueOnce('close-order-2');
+      .mockResolvedValueOnce(buildPlacedOrder('close-order-1'))
+      .mockResolvedValueOnce(buildPlacedOrder('close-order-2', { price: 0.38 }));
 
     const userWs = new EventEmitter();
     const monitor = new PositionMonitor(CONDITION_ID, userWs as UserWsManager);
@@ -193,7 +217,7 @@ describe('PositionMonitor', () => {
     cancelMarketOrdersMock.mockResolvedValue(true);
     getTokenBalanceMock.mockResolvedValue(20);
 
-    let resolvePlaceOrder!: (value: string | null) => void;
+    let resolvePlaceOrder!: (value: NonNullable<Awaited<ReturnType<typeof placeLimitOrder>>> | null) => void;
     placeLimitOrderMock.mockImplementationOnce(() =>
       new Promise(resolve => {
         resolvePlaceOrder = resolve;
@@ -239,8 +263,55 @@ describe('PositionMonitor', () => {
 
     expect(closeFailed).toHaveBeenCalledWith('buy-fill-while-placing-close');
 
-    resolvePlaceOrder('close-order-1');
+    resolvePlaceOrder(buildPlacedOrder('close-order-1'));
     await flushPromises();
+
+    monitor.stop();
+  });
+
+  it('completes the close from immediate matched placement without waiting for a WS fill', async () => {
+    cancelMarketOrdersMock.mockResolvedValue(true);
+    getTokenBalanceMock.mockResolvedValue(20);
+    placeLimitOrderMock.mockResolvedValue(
+      buildPlacedOrder('close-order-1', { status: 'matched' })
+    );
+    getOrderStatusMock.mockResolvedValue({
+      sizeMatched: 20,
+      originalSize: 20,
+      status: 'matched',
+      price: 0.4,
+      assetId: TOKEN_ID,
+    });
+
+    const userWs = new EventEmitter();
+    const monitor = new PositionMonitor(CONDITION_ID, userWs as UserWsManager);
+    const closeComplete = jest.fn();
+
+    monitor.on('closeComplete', closeComplete);
+    monitor.trackOrders([
+      { orderId: 'buy-order-1', tokenId: TOKEN_ID, side: 'BUY', price: 0.4, size: 20 },
+    ]);
+
+    userWs.emit('fill', {
+      orderId: 'buy-order-1',
+      assetId: TOKEN_ID,
+      conditionId: CONDITION_ID,
+      price: 0.4,
+      size: 20,
+      side: 'BUY',
+      feeRateBps: 0,
+      eventKey: 'fill-immediate-close-1',
+    });
+
+    await flushPromises();
+    await flushPromises();
+
+    expect(getOrderStatusMock).toHaveBeenCalledWith('close-order-1');
+    expect(closeComplete).toHaveBeenCalled();
+    expect(monitor.isClosing()).toBe(false);
+    expect(loggerMock.info).toHaveBeenCalledWith(
+      expect.stringContaining('source=reconcile:close-initial-post-status')
+    );
 
     monitor.stop();
   });

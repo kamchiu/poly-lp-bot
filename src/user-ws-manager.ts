@@ -20,7 +20,7 @@ export interface UserWsCreds {
  * emits `fill` events when orders are matched.
  *
  * Events emitted:
- *   - 'fill' : { orderId, assetId, conditionId, price, size, side, feeRateBps }
+ *   - 'fill' : { orderId, assetId, conditionId, price, size, side, feeRateBps, source }
  *   - 'connected' : WS opened and subscribed
  *   - 'disconnected' : WS closed
  */
@@ -192,7 +192,49 @@ export class UserWsManager extends EventEmitter {
 
   private handleTradeEvent(trade: Record<string, unknown>): void {
     const conditionId = (trade['market'] as string) ?? '';
+    const traderSide = ((trade['trader_side'] as string) ?? '').toUpperCase();
     const makerOrders = trade['maker_orders'];
+
+    if (traderSide === 'TAKER') {
+      const orderId = (trade['taker_order_id'] as string) ?? '';
+      const assetId = (trade['asset_id'] as string) ?? '';
+      const price = parseFloat(trade['price'] as string) || 0;
+      const size = parseFloat(trade['size'] as string) || 0;
+      const side = ((trade['side'] as string) ?? '').toUpperCase();
+      const feeRateBps = parseFloat(trade['fee_rate_bps'] as string) || 0;
+      const eventKey = [
+        String(trade['id'] ?? ''),
+        String(trade['transaction_hash'] ?? trade['tx_hash'] ?? ''),
+        String(trade['timestamp'] ?? trade['match_time'] ?? ''),
+        conditionId,
+        orderId,
+        assetId,
+        side,
+        String(trade['price'] ?? ''),
+        String(trade['size'] ?? ''),
+      ].join('|');
+
+      if (!orderId || !assetId) {
+        logger.warn(
+          `[UserWS] taker trade missing taker_order_id or asset_id — dropping: ${JSON.stringify(trade).slice(0, 200)}`
+        );
+        return;
+      }
+
+      this.emitFill({
+        role: 'TAKER',
+        source: 'user-ws',
+        orderId,
+        assetId,
+        conditionId,
+        price,
+        size,
+        side,
+        feeRateBps,
+        eventKey,
+      });
+      return;
+    }
 
     if (!Array.isArray(makerOrders) || makerOrders.length === 0) {
       logger.debug(`[UserWS] Trade event has no maker_orders — ${JSON.stringify(trade).slice(0, 200)}`);
@@ -231,13 +273,39 @@ export class UserWsManager extends EventEmitter {
         continue;
       }
 
-      logger.info(
-        `[UserWS] Fill: orderId=${orderId.slice(0, 10)}… assetId=${assetId.slice(0, 10)}… ` +
-        `market=${conditionId.slice(0, 10)}… ${side} size=${size} @ ${price}`
-      );
-
-      this.emit('fill', { orderId, assetId, conditionId, price, size, side, feeRateBps, eventKey });
+      this.emitFill({
+        role: 'MAKER',
+        source: 'user-ws',
+        orderId,
+        assetId,
+        conditionId,
+        price,
+        size,
+        side,
+        feeRateBps,
+        eventKey,
+      });
     }
+  }
+
+  private emitFill(fill: {
+    role: 'TAKER' | 'MAKER';
+    source: string;
+    orderId: string;
+    assetId: string;
+    conditionId: string;
+    price: number;
+    size: number;
+    side: string;
+    feeRateBps: number;
+    eventKey: string;
+  }): void {
+    logger.info(
+      `[UserWS] Fill: source=${fill.source} role=${fill.role} orderId=${fill.orderId.slice(0, 10)}… assetId=${fill.assetId.slice(0, 10)}… ` +
+      `market=${fill.conditionId.slice(0, 10)}… ${fill.side} size=${fill.size} @ ${fill.price}`
+    );
+
+    this.emit('fill', fill);
   }
 
   private scheduleReconnect(): void {

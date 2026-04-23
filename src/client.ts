@@ -161,7 +161,7 @@ export async function getOpenOrders(conditionId: string): Promise<any[]> {
 export async function cancelMarketOrders(conditionId: string): Promise<boolean> {
   try {
     await client.cancelMarketOrders({ market: conditionId } as any);
-    logger.info(`[Client] Cancelled orders for market ${conditionId.slice(0, 10)}...`);
+    logger.info(`[Client] cancelMarketOrders success market=${conditionId.slice(0, 10)}...`);
     return true;
   } catch (err) {
     logger.warn(`[Client] cancelMarketOrders failed for ${conditionId}:`, err);
@@ -174,7 +174,7 @@ export async function placeLimitOrder(
   price: number,
   size: number,
   tokenId: string
-): Promise<string | null> {
+): Promise<PlacedOrder | null> {
   try {
     const order = await client.createOrder({
       tokenID: tokenId,
@@ -184,19 +184,42 @@ export async function placeLimitOrder(
     });
     const resp = await client.postOrder(order, 'GTC' as any);
     const r = resp as any;
-    logger.info(`[Client] postOrder response ${side}@${price}: ${JSON.stringify(r)}`);
+    const responseStatus = typeof r.status === 'string' ? r.status : 'unknown';
+    const responseOrderId = r.orderID ?? r.order_id ?? 'missing';
+    logger.info(
+      `[Client] postOrder response side=${side} price=${price} size=${size} ` +
+      `token=${tokenId.slice(0, 10)}... status=${responseStatus} orderId=${responseOrderId} payload=${JSON.stringify(r)}`
+    );
     if (r.error) {
       const msg = r.error ?? r.errorMsg ?? 'unknown error';
       logger.warn(`[Client] placeLimitOrder rejected ${side}@${price}: ${msg} (status=${r.status})`);
       return null;
     }
-    const orderId = r.orderID ?? r.order_id ?? 'unknown';
-    logger.info(`[Client] Placed ${side} @ ${price} size=${size} token=${tokenId.slice(0, 10)}... → orderId=${orderId}`);
-    return orderId;
+    const orderId = r.orderID ?? r.order_id;
+    if (!orderId) {
+      logger.warn(`[Client] placeLimitOrder missing order id ${side}@${price}: ${JSON.stringify(r)}`);
+      return null;
+    }
+
+    const status = typeof r.status === 'string' ? r.status : '';
+    logger.info(
+      `[Client] Placed ${side} @ ${price} size=${size} token=${tokenId.slice(0, 10)}... ` +
+      `→ orderId=${orderId} status=${status || 'unknown'}`
+    );
+    return { orderId, status, price, size, tokenId, side };
   } catch (err) {
     logger.warn(`[Client] placeLimitOrder failed ${side}@${price}:`, err);
     return null;
   }
+}
+
+export interface PlacedOrder {
+  orderId: string;
+  status: string;
+  price: number;
+  size: number;
+  tokenId: string;
+  side: 'BUY' | 'SELL';
 }
 
 export interface OrderStatus {

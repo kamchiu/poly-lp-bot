@@ -2,10 +2,12 @@ import { EventEmitter } from 'events';
 import { MarketMaker } from '../market-maker';
 import type { UserWsManager } from '../user-ws-manager';
 import type { WsManager } from '../ws-manager';
+import logger from '../logger';
 import {
   cancelMarketOrders,
   cancelOrder,
   getBestBidAsk,
+  getOrderStatus,
   placeLimitOrder,
   getMarketInfo,
   getRestMid,
@@ -17,6 +19,7 @@ jest.mock('../client', () => ({
   cancelMarketOrders: jest.fn(),
   cancelOrder: jest.fn(),
   getBestBidAsk: jest.fn(),
+  getOrderStatus: jest.fn(),
   placeLimitOrder: jest.fn(),
   getMarketInfo: jest.fn(),
   getRestMid: jest.fn(),
@@ -43,10 +46,30 @@ jest.mock('../logger', () => ({
 const cancelMarketOrdersMock = cancelMarketOrders as jest.MockedFunction<typeof cancelMarketOrders>;
 const cancelOrderMock = cancelOrder as jest.MockedFunction<typeof cancelOrder>;
 const getBestBidAskMock = getBestBidAsk as jest.MockedFunction<typeof getBestBidAsk>;
+const getOrderStatusMock = getOrderStatus as jest.MockedFunction<typeof getOrderStatus>;
 const placeLimitOrderMock = placeLimitOrder as jest.MockedFunction<typeof placeLimitOrder>;
 const getMarketInfoMock = getMarketInfo as jest.MockedFunction<typeof getMarketInfo>;
 const getRestMidMock = getRestMid as jest.MockedFunction<typeof getRestMid>;
 const getTokenBalanceMock = getTokenBalance as jest.MockedFunction<typeof getTokenBalance>;
+const loggerMock = logger as unknown as {
+  info: jest.Mock;
+  warn: jest.Mock;
+  error: jest.Mock;
+  debug: jest.Mock;
+};
+
+const buildPlacedOrder = (
+  orderId: string,
+  overrides: Partial<NonNullable<Awaited<ReturnType<typeof placeLimitOrder>>>> = {},
+): NonNullable<Awaited<ReturnType<typeof placeLimitOrder>>> => ({
+  orderId,
+  status: 'live',
+  price: 0.45,
+  size: 20,
+  tokenId: 'token-id',
+  side: 'BUY',
+  ...overrides,
+});
 
 const flushPromises = async (): Promise<void> => {
   for (let i = 0; i < 10; i++) {
@@ -97,6 +120,7 @@ describe('MarketMaker', () => {
     cancelMarketOrdersMock.mockReset();
     cancelOrderMock.mockReset();
     getBestBidAskMock.mockReset();
+    getOrderStatusMock.mockReset();
     placeLimitOrderMock.mockReset();
     getMarketInfoMock.mockReset();
     getRestMidMock.mockReset();
@@ -123,10 +147,10 @@ describe('MarketMaker', () => {
     getMarketInfoMock.mockResolvedValue({ v: 0.045, tick_size: 0.01 });
     getRestMidMock.mockResolvedValue(0.5);
     placeLimitOrderMock
-      .mockResolvedValueOnce('yes-order-1')
-      .mockResolvedValueOnce('no-order-1')
-      .mockResolvedValueOnce('yes-order-2')
-      .mockResolvedValueOnce('no-order-2');
+      .mockResolvedValueOnce(buildPlacedOrder('yes-order-1'))
+      .mockResolvedValueOnce(buildPlacedOrder('no-order-1'))
+      .mockResolvedValueOnce(buildPlacedOrder('yes-order-2'))
+      .mockResolvedValueOnce(buildPlacedOrder('no-order-2'));
 
     const cfg = createConfig();
     const wsManager = new EventEmitter();
@@ -168,10 +192,10 @@ describe('MarketMaker', () => {
     getMarketInfoMock.mockResolvedValue({ v: 0.045, tick_size: 0.01 });
     getRestMidMock.mockResolvedValue(0.5);
     placeLimitOrderMock
-      .mockResolvedValueOnce('yes-order-1')
-      .mockResolvedValueOnce('no-order-1')
-      .mockResolvedValueOnce('yes-order-2')
-      .mockResolvedValueOnce('no-order-2');
+      .mockResolvedValueOnce(buildPlacedOrder('yes-order-1'))
+      .mockResolvedValueOnce(buildPlacedOrder('no-order-1'))
+      .mockResolvedValueOnce(buildPlacedOrder('yes-order-2'))
+      .mockResolvedValueOnce(buildPlacedOrder('no-order-2'));
 
     const cfg = createConfig({
       condition_id: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -227,8 +251,8 @@ describe('MarketMaker', () => {
       .mockResolvedValue(true);
 
     placeLimitOrderMock
-      .mockResolvedValueOnce('yes-order-1')
-      .mockResolvedValueOnce('no-order-1')
+      .mockResolvedValueOnce(buildPlacedOrder('yes-order-1'))
+      .mockResolvedValueOnce(buildPlacedOrder('no-order-1'))
       .mockResolvedValueOnce(null);
 
     const cfg = createConfig({
@@ -287,8 +311,8 @@ describe('MarketMaker', () => {
       .mockImplementationOnce(() => driftCancelPromise);
 
     placeLimitOrderMock
-      .mockResolvedValueOnce('yes-order-1')
-      .mockResolvedValueOnce('no-order-1');
+      .mockResolvedValueOnce(buildPlacedOrder('yes-order-1'))
+      .mockResolvedValueOnce(buildPlacedOrder('no-order-1'));
 
     const cfg = createConfig({
       condition_id: '0x9999999999999999999999999999999999999999999999999999999999999999',
@@ -313,6 +337,65 @@ describe('MarketMaker', () => {
     resolveDriftCancel(true);
 
     await expect(pausePromise).resolves.toBe(true);
+
+    maker.stop();
+  });
+
+  it('reconciles a tracked LP fill after cancel succeeds', async () => {
+    cancelMarketOrdersMock
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true);
+    getMarketInfoMock.mockResolvedValue({ v: 0.045, tick_size: 0.01 });
+    getRestMidMock.mockResolvedValue(0.5);
+    getTokenBalanceMock.mockResolvedValue(20);
+    placeLimitOrderMock
+      .mockResolvedValueOnce(buildPlacedOrder('yes-order-1', { tokenId: createConfig().yes_token_id }))
+      .mockResolvedValueOnce(buildPlacedOrder('no-order-1', { tokenId: createConfig().no_token_id }))
+      .mockResolvedValueOnce(buildPlacedOrder('close-order-1', {
+        status: 'live',
+        price: 0.46,
+        tokenId: createConfig().yes_token_id,
+        side: 'SELL',
+      }));
+    getOrderStatusMock
+      .mockResolvedValueOnce({
+        sizeMatched: 20,
+        originalSize: 20,
+        status: 'matched',
+        price: 0.46,
+        assetId: createConfig().yes_token_id,
+      })
+      .mockResolvedValueOnce({
+        sizeMatched: 0,
+        originalSize: 20,
+        status: 'cancelled',
+        price: 0.43,
+        assetId: createConfig().no_token_id,
+      })
+      .mockResolvedValue(null);
+
+    const cfg = createConfig();
+    const wsManager = new EventEmitter();
+    const userWsManager = new EventEmitter();
+    const maker = new MarketMaker(cfg, wsManager as WsManager, userWsManager as UserWsManager);
+    const fillDetected = jest.fn();
+
+    maker.positionMonitor.on('fillDetected', fillDetected);
+    maker.start();
+    await flushPromises();
+    await flushPromises();
+
+    await (maker as any).cancelOrders('reconcile-test');
+    await flushPromises();
+    await flushPromises();
+
+    expect(fillDetected).toHaveBeenCalledWith(cfg.condition_id);
+    expect(getOrderStatusMock).toHaveBeenCalledWith('yes-order-1');
+    expect(placeLimitOrderMock).toHaveBeenCalledWith('SELL', 0.46, 20, cfg.yes_token_id);
+    expect(loggerMock.info).toHaveBeenCalledWith(
+      expect.stringContaining('source=reconcile:market-maker:reconcile-test')
+    );
 
     maker.stop();
   });

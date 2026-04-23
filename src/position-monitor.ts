@@ -3,6 +3,7 @@ import {
   cancelMarketOrders,
   cancelOrder,
   getBestBidAsk,
+  getOrderStatus,
   getMarketInfo,
   placeLimitOrder,
   getTokenBalance,
@@ -56,8 +57,12 @@ export class PositionMonitor extends EventEmitter {
   private processedFill = new Map<string, number>();
   /** Idempotency keys for buy-order fills delivered via user WS replay. */
   private processedBuyEvents = new Set<string>();
+  /** Orders already reconciled via REST after cancel, so later WS replay should be ignored. */
+  private reconciledBuyOrderIds = new Set<string>();
   /** Idempotency keys for close-order fills delivered via user WS replay. */
   private processedCloseEvents = new Set<string>();
+  /** Close orders already reconciled via REST, so later WS replay should be ignored. */
+  private reconciledCloseOrderIds = new Set<string>();
   private closing: CloseState | null = null;
   private riskLockReason: string | null = null;
   private closeWorkflow: Promise<void> | null = null;
@@ -85,6 +90,7 @@ export class PositionMonitor extends EventEmitter {
     this.watchedOrderIds = new Set(orders.map(o => o.orderId));
     this.processedFill.clear();
     this.processedBuyEvents.clear();
+    this.reconciledBuyOrderIds.clear();
     logger.debug(`[${this.shortId}] Tracking ${orders.length} order(s): ${orders.map(o => o.orderId).join(', ')}`);
   }
 
@@ -119,12 +125,14 @@ export class PositionMonitor extends EventEmitter {
     this.watchedOrderIds.clear();
     this.processedFill.clear();
     this.processedBuyEvents.clear();
+    this.reconciledBuyOrderIds.clear();
   }
 
   private clearCloseState(): void {
     this.clearCloseRepriceTimer();
     this.closing = null;
     this.processedCloseEvents.clear();
+    this.reconciledCloseOrderIds.clear();
     this.closeWorkflow = null;
     this.fillDetectedEmitted = false;
   }
@@ -143,8 +151,10 @@ export class PositionMonitor extends EventEmitter {
   }
 
   private handleFill(event: WsFillEvent): void {
+    const fillSource = event.source ?? 'unknown';
     logger.debug(
       `[${this.shortId}] handleFill: orderId=${event.orderId.slice(0, 10)}… ` +
+      `source=${fillSource} ` +
       `eventConditionId=${event.conditionId?.slice(0, 10) || 'null'}… ` +
       `thisConditionId=${this.conditionId.slice(0, 10)}… ` +
       `watched=${this.watchedOrderIds.has(event.orderId)} closing=${this.isClosing()}`
@@ -171,9 +181,15 @@ export class PositionMonitor extends EventEmitter {
   private handleBuyFill(event: WsFillEvent): void {
     const tracked = this.trackedOrders.find(order => order.orderId === event.orderId);
     if (!tracked) return;
+    const fillSource = event.source ?? 'unknown';
+
+    if (this.reconciledBuyOrderIds.has(event.orderId)) {
+      logger.debug(`[${this.shortId}] Ignoring reconciled buy fill replay for ${event.orderId} source=${fillSource}`);
+      return;
+    }
 
     if (this.processedBuyEvents.has(event.eventKey)) {
-      logger.debug(`[${this.shortId}] Ignoring duplicate buy fill event ${event.eventKey}`);
+      logger.debug(`[${this.shortId}] Ignoring duplicate buy fill event ${event.eventKey} source=${fillSource}`);
       return;
     }
     this.processedBuyEvents.add(event.eventKey);
@@ -184,7 +200,8 @@ export class PositionMonitor extends EventEmitter {
 
     if (appliedFillSize <= 0) {
       logger.debug(
-        `[${this.shortId}] Ignoring buy fill: raw=${event.size} remaining=${remainingForOrder} orderId=${event.orderId}`
+        `[${this.shortId}] Ignoring buy fill: source=${fillSource} raw=${event.size} ` +
+        `remaining=${remainingForOrder} orderId=${event.orderId}`
       );
       return;
     }
@@ -233,7 +250,7 @@ export class PositionMonitor extends EventEmitter {
     }
 
     logger.info(
-      `[${this.shortId}] Buy fill detected: orderId=${event.orderId} assetId=${event.assetId.slice(0, 10)}… ` +
+      `[${this.shortId}] Buy fill detected: source=${fillSource} orderId=${event.orderId} assetId=${event.assetId.slice(0, 10)}… ` +
       `side=${event.side} size=${appliedFillSize} orderFilled=${this.processedFill.get(event.orderId)}/${tracked.size} ` +
       `closeTarget=${this.closing.sizeTarget} @ ${event.price}`
     );
@@ -264,9 +281,15 @@ export class PositionMonitor extends EventEmitter {
 
   private handleCloseFill(event: WsFillEvent): void {
     if (!this.closing) return;
+    const fillSource = event.source ?? 'unknown';
+
+    if (this.reconciledCloseOrderIds.has(event.orderId)) {
+      logger.debug(`[${this.shortId}] Ignoring reconciled close fill replay for ${event.orderId} source=${fillSource}`);
+      return;
+    }
 
     if (this.processedCloseEvents.has(event.eventKey)) {
-      logger.debug(`[${this.shortId}] Ignoring duplicate close fill event ${event.eventKey}`);
+      logger.debug(`[${this.shortId}] Ignoring duplicate close fill event ${event.eventKey} source=${fillSource}`);
       return;
     }
     this.processedCloseEvents.add(event.eventKey);
@@ -275,14 +298,15 @@ export class PositionMonitor extends EventEmitter {
     const appliedFillSize = Math.min(event.size, remainingToClose);
     if (appliedFillSize <= 0) {
       logger.debug(
-        `[${this.shortId}] Ignoring close fill: raw=${event.size} remaining=${remainingToClose} orderId=${event.orderId}`
+        `[${this.shortId}] Ignoring close fill: source=${fillSource} raw=${event.size} ` +
+        `remaining=${remainingToClose} orderId=${event.orderId}`
       );
       return;
     }
 
     this.closing.sizeFilled += appliedFillSize;
     logger.info(
-      `[${this.shortId}] Close fill: orderId=${event.orderId} size=${appliedFillSize} ` +
+      `[${this.shortId}] Close fill: source=${fillSource} orderId=${event.orderId} size=${appliedFillSize} ` +
       `filled=${this.closing.sizeFilled}/${this.closing.sizeTarget} @ ${event.price}`
     );
 
@@ -340,6 +364,10 @@ export class PositionMonitor extends EventEmitter {
     }
     if (!this.closing) return;
 
+    logger.info(`[${this.shortId}] LP cancel confirmed — source=reconcile:close-workflow-cancel`);
+    await this.reconcileTrackedOrders('close-workflow-cancel');
+    if (!this.closing || this.riskLockReason) return;
+
     this.closing.phase = 'awaiting-balance';
 
     // Wait for token balance to arrive (settlement delay after fill)
@@ -385,20 +413,21 @@ export class PositionMonitor extends EventEmitter {
 
     this.closing.phase = 'placing-limit';
     const closePrice = await this.computeClosePrice();
-    const closeOrderId = await placeLimitOrder(
+    const placedOrder = await placeLimitOrder(
       'SELL',
       closePrice,
       remainingToClose,
       this.closing.tokenId,
     );
 
-    if (!closeOrderId) {
+    if (!placedOrder) {
       logger.warn(`[${this.shortId}] Close ${reason} placement failed — risk locking`);
       this.enterRiskLock(reason === 'initial' ? 'limit-placement-failed' : 'close-reprice-placement-failed');
       return;
     }
 
     if (!this.closing) return;
+    const closeOrderId = placedOrder.orderId;
     this.closing.closeOrderId = closeOrderId;
     this.closing.closePrice = closePrice;
     this.closing.closeOrderIds.push(closeOrderId);
@@ -406,7 +435,10 @@ export class PositionMonitor extends EventEmitter {
     this.closing.phase = 'waiting-close-fill';
 
     if (reason === 'initial') {
-      logger.info(`[${this.shortId}] Close limit order placed: ${closeOrderId} @ ${closePrice} — waiting for WS fill event`);
+      logger.info(
+        `[${this.shortId}] Close limit order placed: ${closeOrderId} @ ${closePrice} ` +
+        `status=${placedOrder.status || 'unknown'} — waiting for fill`
+      );
       await notifyClosePlaced({
         conditionId: this.conditionId,
         tokenId: this.closing.tokenId,
@@ -418,8 +450,15 @@ export class PositionMonitor extends EventEmitter {
     } else {
       logger.info(
         `[${this.shortId}] Close limit order repriced: ${closeOrderId} @ ${closePrice} ` +
-        `remaining=${remainingToClose}`
+        `status=${placedOrder.status || 'unknown'} remaining=${remainingToClose}`
       );
+    }
+
+    if (!this.isLiveOrderStatus(placedOrder.status)) {
+      await this.reconcileCloseOrder(closeOrderId, `close-${reason}-post-status`, placedOrder.status);
+      if (!this.closing || this.riskLockReason || this.closing.closeOrderId !== closeOrderId) {
+        return;
+      }
     }
 
     this.scheduleCloseReprice();
@@ -487,9 +526,108 @@ export class PositionMonitor extends EventEmitter {
     this.riskLockReason = null;
     this.emit('closeComplete');
   }
+
+  async reconcileTrackedOrders(reason: string): Promise<void> {
+    const reconcileSource = `reconcile:${reason}`;
+    logger.info(`[${this.shortId}] Reconcile start: source=${reconcileSource} tracked=${this.trackedOrders.length}`);
+
+    for (const tracked of this.trackedOrders) {
+      const status = await getOrderStatus(tracked.orderId);
+      if (!status) continue;
+
+      if (this.isLiveOrderStatus(status.status)) {
+        logger.debug(
+          `[${this.shortId}] Reconcile ${reason}: source=${reconcileSource} order ${tracked.orderId} still live ` +
+          `(matched=${status.sizeMatched}/${status.originalSize})`
+        );
+        continue;
+      }
+
+      const alreadyProcessed = this.processedFill.get(tracked.orderId) ?? 0;
+      const delta = Math.max(0, status.sizeMatched - alreadyProcessed);
+      if (delta <= 0) continue;
+
+      logger.info(
+        `[${this.shortId}] Reconcile ${reason}: source=${reconcileSource} orderId=${tracked.orderId} ` +
+        `status=${status.status} matched=${status.sizeMatched}/${status.originalSize}`
+      );
+
+      this.handleBuyFill({
+        source: reconcileSource,
+        orderId: tracked.orderId,
+        assetId: status.assetId || tracked.tokenId,
+        conditionId: this.conditionId,
+        price: status.price || tracked.price,
+        size: delta,
+        side: tracked.side,
+        feeRateBps: 0,
+        eventKey: `reconcile-buy|${reason}|${tracked.orderId}|${status.sizeMatched}|${status.status}`,
+      });
+      this.reconciledBuyOrderIds.add(tracked.orderId);
+    }
+  }
+
+  private async reconcileCloseOrder(
+    orderId: string,
+    reason: string,
+    initialStatus: string,
+  ): Promise<void> {
+    const reconcileSource = `reconcile:${reason}`;
+    const status = await getOrderStatus(orderId);
+    if (!status) return;
+
+    if (this.isLiveOrderStatus(status.status)) {
+      logger.debug(
+        `[${this.shortId}] Close order ${orderId} returned status=${initialStatus}, ` +
+        `source=${reconcileSource}, ` +
+        `but getOrderStatus is still live`
+      );
+      return;
+    }
+
+    if (status.sizeMatched > 0) {
+      logger.info(
+        `[${this.shortId}] Reconcile close order ${orderId}: source=${reconcileSource} ` +
+        `status=${status.status} matched=${status.sizeMatched}/${status.originalSize}`
+      );
+      this.handleCloseFill({
+        source: reconcileSource,
+        orderId,
+        assetId: status.assetId || this.closing?.tokenId || '',
+        conditionId: this.conditionId,
+        price: status.price || this.closing?.closePrice || 0,
+        size: status.sizeMatched,
+        side: 'SELL',
+        feeRateBps: 0,
+        eventKey: `reconcile-close|${orderId}|${status.sizeMatched}|${status.status}`,
+      });
+      this.reconciledCloseOrderIds.add(orderId);
+    } else {
+      logger.warn(
+        `[${this.shortId}] Close order ${orderId} is non-live without matched size ` +
+        `(source=${reconcileSource} status=${status.status})`
+      );
+    }
+
+    if (!this.closing || this.riskLockReason) return;
+
+    if (this.closing.closeOrderId === orderId) {
+      this.closing.closeOrderId = null;
+    }
+
+    const remainingToClose = Math.max(0, this.closing.sizeTarget - this.closing.sizeFilled);
+    if (remainingToClose > 0 && !this.closing.closeOrderId) {
+      await this.placeCloseOrder('reprice');
+    }
+  }
+
+  private isLiveOrderStatus(status: string): boolean {
+    return status.trim().toLowerCase() === 'live';
+  }
 }
 
 interface WsFillEvent {
+  source?: string;
   orderId: string;
   assetId: string;
   conditionId: string;
