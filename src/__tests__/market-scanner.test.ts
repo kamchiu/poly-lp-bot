@@ -83,7 +83,8 @@ describe('market-scanner catalyst filter', () => {
         reward,
         100,
         new Date('2026-04-22T00:00:00Z'),
-        { exactCompetitiveness: 0 }
+        { exactCompetitiveness: 0 },
+        { bestBid: 0.45, bestAsk: 0.55 }
       )
     ).not.toBeNull();
 
@@ -92,7 +93,8 @@ describe('market-scanner catalyst filter', () => {
         buildReward({ market_competitiveness: 1 }),
         100,
         new Date('2026-04-22T00:00:00Z'),
-        { exactCompetitiveness: 0 }
+        { exactCompetitiveness: 0 },
+        { bestBid: 0.45, bestAsk: 0.55 }
       )
     ).toBeNull();
   });
@@ -107,6 +109,8 @@ describe('market-scanner catalyst filter', () => {
       reward,
       250,
       new Date('2026-04-22T00:00:00Z'),
+      {},
+      { bestBid: 0.45, bestAsk: 0.55 }
     );
 
     expect(scored).not.toBeNull();
@@ -121,6 +125,8 @@ describe('market-scanner catalyst filter', () => {
         reward,
         100,
         new Date('2026-04-22T00:00:00Z'),
+        {},
+        { bestBid: 0.45, bestAsk: 0.55 }
       )
     ).toBeNull();
   });
@@ -136,6 +142,8 @@ describe('market-scanner catalyst filter', () => {
         reward,
         100,
         new Date('2026-04-22T00:00:00Z'),
+        {},
+        { bestBid: 0.45, bestAsk: 0.55 }
       )
     ).not.toBeNull();
   });
@@ -160,14 +168,59 @@ describe('market-scanner catalyst filter', () => {
         reward,
         100,
         new Date('2026-04-22T00:00:00Z'),
+        {},
+        { bestBid: 0.45, bestAsk: 0.55 }
+      )
+    ).toBeNull();
+  });
+
+  it('filters on best bid and best ask ranges instead of midpoint', () => {
+    const reward = buildReward({
+      tokens: [
+        { token_id: 'yes-token', outcome: 'Yes', price: 0.95 },
+        { token_id: 'no-token', outcome: 'No', price: 0.05 },
+      ],
+    });
+
+    expect(
+      scoreMarket(
+        reward,
+        100,
+        new Date('2026-04-22T00:00:00Z'),
+        {
+          minMid: 0,
+          maxMid: 1,
+          minBestBid: 0.1,
+          maxBestBid: 0.9,
+          minBestAsk: 0.1,
+          maxBestAsk: 0.9,
+        },
+        { bestBid: 0.4, bestAsk: 0.6 }
+      )
+    ).not.toBeNull();
+
+    expect(
+      scoreMarket(
+        reward,
+        100,
+        new Date('2026-04-22T00:00:00Z'),
+        {
+          minMid: 0,
+          maxMid: 1,
+          minBestBid: 0.1,
+          maxBestBid: 0.9,
+          minBestAsk: 0.1,
+          maxBestAsk: 0.9,
+        },
+        { bestBid: 0.05, bestAsk: 0.6 }
       )
     ).toBeNull();
   });
 });
 
 describe('selectMarkets', () => {
-  it('returns all passing markets when count is omitted', () => {
-    const selected = selectMarkets(
+  it('returns all passing markets when count is omitted', async () => {
+    const selected = await selectMarkets(
       [
         buildReward({
           condition_id: 'cond-1',
@@ -199,8 +252,8 @@ describe('selectMarkets', () => {
     expect(selected).toHaveLength(2);
   });
 
-  it('runtime-style scan options keep only explicit requirements plus the mid range filter', () => {
-    const selected = selectMarkets(
+  it('runtime-style scan options keep explicit requirements plus best bid/ask filters', async () => {
+    const selected = await selectMarkets(
       [
         buildReward({
           condition_id: 'cond-runtime',
@@ -232,7 +285,16 @@ describe('selectMarkets', () => {
         minVolume24h: 0,
         maxVolume24h: Number.POSITIVE_INFINITY,
         minDaysToEvent: Number.NEGATIVE_INFINITY,
+        minMid: 0,
+        maxMid: 1,
+        minBestBid: 0.1,
+        maxBestBid: 0.9,
+        minBestAsk: 0.1,
+        maxBestAsk: 0.9,
         exactCompetitiveness: 0,
+        bestPricesByTokenId: {
+          'yes-runtime': { bestBid: 0.4, bestAsk: 0.6 },
+        },
       }
     );
 

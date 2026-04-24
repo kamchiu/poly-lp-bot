@@ -1,6 +1,9 @@
 import { EventEmitter } from 'events';
 import logger from '../logger';
-import { SimpleMarketSupervisor } from '../simple-market-supervisor';
+import {
+  buildSimpleRuntimeScanOptions,
+  SimpleMarketSupervisor,
+} from '../simple-market-supervisor';
 import type {
   Defaults,
   ResolvedMarketConfig,
@@ -297,5 +300,16 @@ describe('SimpleMarketSupervisor', () => {
       `fill:${firstMarket.condition_id.slice(0, 10)}`
     );
     expect(makers.get(secondMarket.condition_id)?.shutdown).not.toHaveBeenCalled();
+  });
+});
+
+describe('buildSimpleRuntimeScanOptions', () => {
+  it('adds a count limit when market_count is a positive number', () => {
+    expect(buildSimpleRuntimeScanOptions(5).count).toBe(5);
+  });
+
+  it('leaves count unset when market_count is null or invalid', () => {
+    expect(buildSimpleRuntimeScanOptions(null).count).toBeUndefined();
+    expect(buildSimpleRuntimeScanOptions(0).count).toBeUndefined();
   });
 });

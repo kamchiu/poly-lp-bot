@@ -25,8 +25,14 @@ export const SIMPLE_RUNTIME_SCAN_OPTIONS: Readonly<ScanMarketsOptions> = {
   maxDailyRate: Number.POSITIVE_INFINITY,
   maxMinShares: 20,
   minVolume24h: 0,
-  maxVolume24h: 100,
+  maxVolume24h: Number.POSITIVE_INFINITY,
   minDaysToEvent: Number.NEGATIVE_INFINITY,
+  minMid: 0,
+  maxMid: 1,
+  minBestBid: 0.2,
+  maxBestBid: 0.8,
+  minBestAsk: 0.2,
+  maxBestAsk: 0.8,
   exactCompetitiveness: 0,
 };
 
@@ -69,12 +75,35 @@ interface SimpleMarketSupervisorOptions {
   defaults: Defaults;
   creds: UserWsCreds;
   scanIntervalMs?: number;
+  scanMarketCount?: number | null;
 }
 
-function buildDefaultDeps(defaults: Defaults): SimpleMarketSupervisorDeps {
+export function buildSimpleRuntimeScanOptions(
+  scanMarketCount?: number | null
+): ScanMarketsOptions {
+  if (
+    typeof scanMarketCount === 'number' &&
+    Number.isFinite(scanMarketCount) &&
+    scanMarketCount > 0
+  ) {
+    return {
+      ...SIMPLE_RUNTIME_SCAN_OPTIONS,
+      count: Math.floor(scanMarketCount),
+    };
+  }
+
+  return { ...SIMPLE_RUNTIME_SCAN_OPTIONS };
+}
+
+function buildDefaultDeps(
+  defaults: Defaults,
+  scanMarketCount?: number | null
+): SimpleMarketSupervisorDeps {
+  const runtimeScanOptions = buildSimpleRuntimeScanOptions(scanMarketCount);
+
   return {
     scanMarkets: async () => {
-      const scannedMarkets = await scanMarkets(SIMPLE_RUNTIME_SCAN_OPTIONS);
+      const scannedMarkets = await scanMarkets(runtimeScanOptions);
       return scannedMarkets.map(scanned =>
         resolveMarketConfig(buildMarketConfigEntry(scanned), defaults)
       );
@@ -147,7 +176,10 @@ export class SimpleMarketSupervisor extends EventEmitter {
     deps?: Partial<SimpleMarketSupervisorDeps>
   ) {
     super();
-    this.deps = { ...buildDefaultDeps(options.defaults), ...deps };
+    this.deps = {
+      ...buildDefaultDeps(options.defaults, options.scanMarketCount),
+      ...deps,
+    };
     this.scanIntervalMs = options.scanIntervalMs ?? SIMPLE_SCAN_INTERVAL_MS;
   }
 

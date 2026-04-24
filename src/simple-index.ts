@@ -27,6 +27,7 @@ async function main() {
   const supervisor = new SimpleMarketSupervisor({
     defaults: appConfig.defaults,
     creds: getApiCreds(),
+    scanMarketCount: appConfig.scan?.market_count,
   });
 
   let stopInProgress = false;

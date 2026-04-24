@@ -24,8 +24,13 @@ export interface Defaults {
   fill_poll_interval_ms: number;
 }
 
+export interface ScanConfig {
+  market_count?: number | null;
+}
+
 export interface AppConfig {
   defaults: Defaults;
+  scan?: ScanConfig | null;
   markets: MarketConfig[];
 }
 

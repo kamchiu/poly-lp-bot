@@ -10,6 +10,9 @@ defaults:
   ws_user_host: wss://ws-subscriptions-clob.polymarket.com/ws/user
   fill_poll_interval_ms: 3000
 
+scan:
+  market_count: 5 # null = run all matched markets
+
 markets:
   - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-nuclear-or-nuke-be-said-on-iceman
     # Optional per-market overrides:

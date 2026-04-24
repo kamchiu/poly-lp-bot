@@ -61,6 +61,41 @@ function httpsGet(url: string): Promise<unknown> {
   });
 }
 
+function httpsPost(url: string, body: unknown): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const parsedUrl = new URL(url);
+    const options: https.RequestOptions = {
+      method: 'POST',
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port ? parseInt(parsedUrl.port, 10) : undefined,
+      path: `${parsedUrl.pathname}${parsedUrl.search}`,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      agent: proxyAgent,
+    };
+
+    const req = https.request(options, res => {
+      let raw = '';
+      res.on('data', chunk => (raw += chunk));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(raw));
+        } catch (e) {
+          reject(new Error(`JSON parse error for ${url}: ${(e as Error).message}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(15_000, () => req.destroy(new Error(`Timeout: ${url}`)));
+    req.write(payload);
+    req.end();
+  });
+}
+
 interface RewardsConfig {
   asset_address: string;
   start_date: string;
@@ -119,12 +154,19 @@ async function fetchAllMultiRewards(): Promise<MarketReward[]> {
 
 export interface ScoredMarket {
   reward: MarketReward;
-  mid: number;
+  mid: number | null;
+  bestBid: number;
+  bestAsk: number;
   dailyRate: number;
   competitiveness: number;
   score: number;
   yesTokenId: string;
   noTokenId: string;
+}
+
+export interface BestPrices {
+  bestBid: number | null;
+  bestAsk: number | null;
 }
 
 interface ManualSelectionFilters {
@@ -143,6 +185,10 @@ export interface ScanFilters extends ManualSelectionFilters {
   maxVolume24h?: number;
   minMid?: number;
   maxMid?: number;
+  minBestBid?: number;
+  maxBestBid?: number;
+  minBestAsk?: number;
+  maxBestAsk?: number;
   maxCompetitiveness?: number;
   exactCompetitiveness?: number;
 }
@@ -150,6 +196,7 @@ export interface ScanFilters extends ManualSelectionFilters {
 export interface ScanMarketsOptions extends ScanFilters {
   count?: number;
   now?: Date;
+  bestPricesByTokenId?: Record<string, BestPrices>;
 }
 
 interface ResolvedScanFilters {
@@ -160,6 +207,10 @@ interface ResolvedScanFilters {
   maxVolume24h: number;
   minMid: number;
   maxMid: number;
+  minBestBid?: number;
+  maxBestBid?: number;
+  minBestAsk?: number;
+  maxBestAsk?: number;
   maxCompetitiveness: number;
   exactCompetitiveness?: number;
   whitelistSlugs: string[];
@@ -185,6 +236,10 @@ export const DEFAULT_SCAN_FILTERS: Readonly<ResolvedScanFilters> = {
   maxVolume24h: MAX_VOLUME_24H,
   minMid: MIN_MID,
   maxMid: MAX_MID,
+  minBestBid: undefined,
+  maxBestBid: undefined,
+  minBestAsk: undefined,
+  maxBestAsk: undefined,
   maxCompetitiveness: MAX_COMPETITIVENESS,
   whitelistSlugs: WHITELIST_SLUGS,
   blacklistSlugs: BLACKLIST_SLUGS,
@@ -202,6 +257,10 @@ function resolveScanFilters(filters: ScanFilters = {}): ResolvedScanFilters {
     maxVolume24h: filters.maxVolume24h ?? DEFAULT_SCAN_FILTERS.maxVolume24h,
     minMid: filters.minMid ?? DEFAULT_SCAN_FILTERS.minMid,
     maxMid: filters.maxMid ?? DEFAULT_SCAN_FILTERS.maxMid,
+    minBestBid: filters.minBestBid ?? DEFAULT_SCAN_FILTERS.minBestBid,
+    maxBestBid: filters.maxBestBid ?? DEFAULT_SCAN_FILTERS.maxBestBid,
+    minBestAsk: filters.minBestAsk ?? DEFAULT_SCAN_FILTERS.minBestAsk,
+    maxBestAsk: filters.maxBestAsk ?? DEFAULT_SCAN_FILTERS.maxBestAsk,
     maxCompetitiveness: filters.maxCompetitiveness ?? DEFAULT_SCAN_FILTERS.maxCompetitiveness,
     exactCompetitiveness: filters.exactCompetitiveness,
     whitelistSlugs: filters.whitelistSlugs ?? DEFAULT_SCAN_FILTERS.whitelistSlugs,
@@ -280,56 +339,176 @@ export function isNearCatalyst(
   return daysToEvent !== null && daysToEvent < minDaysToEvent;
 }
 
+interface CandidateMarket {
+  reward: MarketReward;
+  aggregateDailyRate: number;
+  yesTokenId: string;
+  noTokenId: string;
+}
+
+function hasBestPriceFilters(filters: ResolvedScanFilters): boolean {
+  return (
+    filters.minBestBid !== undefined ||
+    filters.maxBestBid !== undefined ||
+    filters.minBestAsk !== undefined ||
+    filters.maxBestAsk !== undefined
+  );
+}
+
+function parseNumericValue(value: unknown): number | null {
+  const parsed = parseFloat(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function setSidePrice(
+  pricesByTokenId: Record<string, BestPrices>,
+  tokenId: string,
+  side: string,
+  price: unknown
+): void {
+  const parsedPrice = parseNumericValue(price);
+  if (parsedPrice === null) return;
+
+  const next = pricesByTokenId[tokenId] ?? { bestBid: null, bestAsk: null };
+  const normalizedSide = side.toUpperCase();
+  if (normalizedSide === 'BUY') next.bestBid = parsedPrice;
+  if (normalizedSide === 'SELL') next.bestAsk = parsedPrice;
+  pricesByTokenId[tokenId] = next;
+}
+
+function mergeBatchPrices(
+  pricesByTokenId: Record<string, BestPrices>,
+  payload: unknown
+): void {
+  if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      if (!entry || typeof entry !== 'object') continue;
+      const tokenId = String((entry as Record<string, unknown>)['token_id'] ?? '');
+      const side = String((entry as Record<string, unknown>)['side'] ?? '');
+      const price = (entry as Record<string, unknown>)['price'];
+      if (tokenId && side) setSidePrice(pricesByTokenId, tokenId, side, price);
+    }
+    return;
+  }
+
+  if (!payload || typeof payload !== 'object') return;
+
+  for (const [tokenId, value] of Object.entries(payload as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const sideMap = value as Record<string, unknown>;
+    setSidePrice(pricesByTokenId, tokenId, 'BUY', sideMap['BUY'] ?? sideMap['buy']);
+    setSidePrice(pricesByTokenId, tokenId, 'SELL', sideMap['SELL'] ?? sideMap['sell']);
+  }
+}
+
+async function fetchBestPricesByTokenId(tokenIds: string[]): Promise<Record<string, BestPrices>> {
+  const uniqueTokenIds = [...new Set(tokenIds)].filter(Boolean);
+  const pricesByTokenId: Record<string, BestPrices> = {};
+  const chunkSize = 250;
+
+  const requests: Promise<unknown>[] = [];
+  for (let start = 0; start < uniqueTokenIds.length; start += chunkSize) {
+    const chunk = uniqueTokenIds.slice(start, start + chunkSize);
+    requests.push(
+      httpsPost(
+        `${CLOB_HOST}/prices`,
+        chunk.flatMap(tokenId => [
+          { token_id: tokenId, side: 'BUY' },
+          { token_id: tokenId, side: 'SELL' },
+        ])
+      )
+    );
+  }
+
+  const responses = await Promise.all(requests);
+  for (const response of responses) {
+    mergeBatchPrices(pricesByTokenId, response);
+  }
+
+  return pricesByTokenId;
+}
+
+function passesStaticFilters(
+  reward: MarketReward,
+  aggregateDailyRate: number,
+  now: Date,
+  filters: ResolvedScanFilters
+): boolean {
+  if (aggregateDailyRate < filters.minDailyRate || aggregateDailyRate > filters.maxDailyRate) {
+    return false;
+  }
+
+  if (!passesManualSelection(reward, filters)) return false;
+  if (isNearCatalyst(reward, now, filters.minDaysToEvent)) return false;
+
+  if (reward.rewards_min_size <= 0 || reward.rewards_min_size > filters.maxMinShares) {
+    return false;
+  }
+
+  if (filters.exactCompetitiveness !== undefined) {
+    if (reward.market_competitiveness !== filters.exactCompetitiveness) return false;
+  } else if (reward.market_competitiveness > filters.maxCompetitiveness) {
+    return false;
+  }
+
+  if (reward.volume_24hr < filters.minVolume24h || reward.volume_24hr > filters.maxVolume24h) {
+    return false;
+  }
+
+  return true;
+}
+
 export function scoreMarket(
   reward: MarketReward,
   aggregateDailyRate: number,
   now: Date = new Date(),
-  filters: ScanFilters = {}
+  filters: ScanFilters = {},
+  bestPrices: BestPrices | null = null
 ): ScoredMarket | null {
   const resolvedFilters = resolveScanFilters(filters);
-
-  if (
-    aggregateDailyRate < resolvedFilters.minDailyRate ||
-    aggregateDailyRate > resolvedFilters.maxDailyRate
-  ) {
-    return null;
-  }
-
-  if (!passesManualSelection(reward, resolvedFilters)) return null;
-  if (isNearCatalyst(reward, now, resolvedFilters.minDaysToEvent)) return null;
-
-  if (
-    reward.rewards_min_size <= 0 ||
-    reward.rewards_min_size > resolvedFilters.maxMinShares
-  ) {
-    return null;
-  }
-
-  if (resolvedFilters.exactCompetitiveness !== undefined) {
-    if (reward.market_competitiveness !== resolvedFilters.exactCompetitiveness) return null;
-  } else if (reward.market_competitiveness > resolvedFilters.maxCompetitiveness) {
-    return null;
-  }
-
-  if (
-    reward.volume_24hr < resolvedFilters.minVolume24h ||
-    reward.volume_24hr > resolvedFilters.maxVolume24h
-  ) {
-    return null;
-  }
+  if (!passesStaticFilters(reward, aggregateDailyRate, now, resolvedFilters)) return null;
 
   const yesToken = reward.tokens.find(t => t.outcome === 'Yes') ?? reward.tokens[0];
   const noToken = reward.tokens.find(t => t.outcome === 'No') ?? reward.tokens[1];
   if (!yesToken) return null;
 
-  const mid = yesToken.price;
-  if (mid < resolvedFilters.minMid || mid > resolvedFilters.maxMid) return null;
+  const bestBid = bestPrices?.bestBid ?? null;
+  const bestAsk = bestPrices?.bestAsk ?? null;
+  const bookMid =
+    bestBid !== null &&
+    bestAsk !== null &&
+    bestBid > 0 &&
+    bestAsk > 0 &&
+    bestBid < bestAsk
+      ? (bestBid + bestAsk) / 2
+      : null;
+  const fallbackMid = parseNumericValue(yesToken.price);
+  const mid = bookMid ?? fallbackMid;
+
+  if (resolvedFilters.minBestBid !== undefined && (bestBid === null || bestBid < resolvedFilters.minBestBid)) {
+    return null;
+  }
+  if (resolvedFilters.maxBestBid !== undefined && (bestBid === null || bestBid > resolvedFilters.maxBestBid)) {
+    return null;
+  }
+  if (resolvedFilters.minBestAsk !== undefined && (bestAsk === null || bestAsk < resolvedFilters.minBestAsk)) {
+    return null;
+  }
+  if (resolvedFilters.maxBestAsk !== undefined && (bestAsk === null || bestAsk > resolvedFilters.maxBestAsk)) {
+    return null;
+  }
+
+  if (mid === null || mid < resolvedFilters.minMid || mid > resolvedFilters.maxMid) {
+    return null;
+  }
 
   const crowdPenalty = 1 / (1 + Math.max(reward.market_competitiveness, 0));
   const score = (aggregateDailyRate / reward.rewards_min_size) * crowdPenalty;
 
   return {
     reward,
+    bestBid: bestBid ?? 0,
+    bestAsk: bestAsk ?? 0,
     mid,
     dailyRate: aggregateDailyRate,
     competitiveness: reward.market_competitiveness,
@@ -339,10 +518,10 @@ export function scoreMarket(
   };
 }
 
-export function selectMarkets(
+export async function selectMarkets(
   rewards: MarketReward[],
   options: ScanMarketsOptions = {}
-): ScoredMarket[] {
+): Promise<ScoredMarket[]> {
   const resolvedFilters = resolveScanFilters(options);
   const now = options.now ?? new Date();
   const count =
@@ -357,14 +536,16 @@ export function selectMarkets(
   interface RawEntry {
     reward: MarketReward;
     yesTokenId: string;
+    noTokenId: string;
     rate: number;
   }
 
   const rawEntries: RawEntry[] = cheapFiltered.flatMap(reward => {
     const yesToken = reward.tokens.find(t => t.outcome === 'Yes') ?? reward.tokens[0];
+    const noToken = reward.tokens.find(t => t.outcome === 'No') ?? reward.tokens[1];
     if (!yesToken?.token_id) return [];
     const rate = reward.rewards_config?.[0]?.rate_per_day ?? 0;
-    return [{ reward, yesTokenId: yesToken.token_id, rate }];
+    return [{ reward, yesTokenId: yesToken.token_id, noTokenId: noToken?.token_id ?? '', rate }];
   });
 
   interface TokenGroup {
@@ -398,10 +579,36 @@ export function selectMarkets(
     }
   }
 
-  const scored: ScoredMarket[] = [];
+  const candidates: CandidateMarket[] = [];
   for (const { representative, totalRate } of tokenGroups.values()) {
-    const result = scoreMarket(representative.reward, totalRate, now, resolvedFilters);
-    if (result !== null) scored.push(result);
+    if (!passesStaticFilters(representative.reward, totalRate, now, resolvedFilters)) continue;
+    candidates.push({
+      reward: representative.reward,
+      aggregateDailyRate: totalRate,
+      yesTokenId: representative.yesTokenId,
+      noTokenId: representative.noTokenId,
+    });
+  }
+
+  const needsBookPrices = hasBestPriceFilters(resolvedFilters) || options.bestPricesByTokenId !== undefined;
+  const bestPricesByTokenId = needsBookPrices
+    ? (options.bestPricesByTokenId ?? await fetchBestPricesByTokenId(candidates.map(candidate => candidate.yesTokenId)))
+    : {};
+
+  const scored: ScoredMarket[] = [];
+  for (const candidate of candidates) {
+    const result = scoreMarket(
+      candidate.reward,
+      candidate.aggregateDailyRate,
+      now,
+      resolvedFilters,
+      bestPricesByTokenId[candidate.yesTokenId] ?? null
+    );
+    if (result !== null) {
+      result.yesTokenId = candidate.yesTokenId;
+      result.noTokenId = candidate.noTokenId;
+      scored.push(result);
+    }
   }
 
   scored.sort((left, right) => right.score - left.score);
@@ -412,7 +619,7 @@ export async function scanMarkets(
   options: ScanMarketsOptions = {}
 ): Promise<ScoredMarket[]> {
   const rewards = await fetchAllMultiRewards();
-  return selectMarkets(rewards, options);
+  return await selectMarkets(rewards, options);
 }
 
 export function buildMarketConfigEntry(scoredMarket: ScoredMarket): MarketConfig {
@@ -464,14 +671,28 @@ function formatFilterSummary(filters: ResolvedScanFilters): string {
     filters.exactCompetitiveness !== undefined
       ? `competitiveness=${filters.exactCompetitiveness}`
       : `competitiveness<=${filters.maxCompetitiveness}`;
+  const bestBidRange =
+    filters.minBestBid !== undefined || filters.maxBestBid !== undefined
+      ? `best_bid=${filters.minBestBid ?? 0}–${filters.maxBestBid ?? 1}`
+      : null;
+  const bestAskRange =
+    filters.minBestAsk !== undefined || filters.maxBestAsk !== undefined
+      ? `best_ask=${filters.minBestAsk ?? 0}–${filters.maxBestAsk ?? 1}`
+      : null;
 
-  return (
+  return [
     `daily_rate=${filters.minDailyRate}–${filters.maxDailyRate} USDC/day | ` +
     `min_size<=${filters.maxMinShares} | ` +
     `vol_24h=${filters.minVolume24h.toLocaleString()}–${filters.maxVolume24h.toLocaleString()} | ` +
     `${competitiveness} | ` +
-    `days_to_event>=${filters.minDaysToEvent}`
-  );
+    `days_to_event>=${filters.minDaysToEvent}`,
+    bestBidRange,
+    bestAskRange,
+  ].filter(Boolean).join(' | ');
+}
+
+function formatPriceCell(price: number): string {
+  return price > 0 ? price.toFixed(2) : 'n/a';
 }
 
 async function main() {
@@ -489,7 +710,7 @@ async function main() {
   const allRewards = await fetchAllMultiRewards();
   console.log(` ${allRewards.length} total`);
 
-  const selected = selectMarkets(allRewards, scanOptions);
+  const selected = await selectMarkets(allRewards, scanOptions);
   console.log(`After all filters: ${selected.length} market(s) pass`);
 
   if (selected.length === 0) {
@@ -498,8 +719,8 @@ async function main() {
   }
 
   console.log('\nSelected markets:');
-  console.log('  #  Score   Rate/day  Compet   D/Event   Mid    Question');
-  console.log('  -- ------  --------  -------  -------  -----  --------');
+  console.log('  #  Score   Rate/day  Compet   D/Event   Bid    Ask    Question');
+  console.log('  -- ------  --------  -------  -------  -----  -----  --------');
 
   const now = scanOptions.now ?? new Date();
   for (let i = 0; i < selected.length; i++) {
@@ -511,7 +732,8 @@ async function main() {
     console.log(
       `  ${String(i + 1).padStart(2)}  ${scored.score.toFixed(1).padStart(6)}  ` +
       `$${scored.dailyRate.toFixed(0).padStart(7)}  ${scored.competitiveness.toFixed(1).padStart(7)}  ` +
-      `${daysToEventText.padStart(7)}  ${scored.mid.toFixed(2)}   ${question}`
+      `${daysToEventText.padStart(7)}  ${formatPriceCell(scored.bestBid).padStart(5)}  ` +
+      `${formatPriceCell(scored.bestAsk).padStart(5)}  ${question}`
     );
   }
 
