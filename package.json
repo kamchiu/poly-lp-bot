@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc",
     "start": "npm run build && node dist/index.js",
+    "start:simple": "npm run build && node dist/simple-index.js",
     "dev": "ts-node src/index.ts",
+    "dev:simple": "ts-node src/simple-index.ts",
     "scan": "ts-node src/market-scanner.ts",
     "test": "jest",
     "test:watch": "jest --watch",
