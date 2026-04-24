@@ -18,6 +18,7 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+.codex
 
 # TypeScript cache
 *.tsbuildinfo

@@ -2,15 +2,33 @@
 defaults:
   min_size: 20
   fallback_v: 0.045
-  spread_factor: 0.7
-  refresh_interval_ms: 70000
+  quote_side: both
+  spread_factor: 0.6
+  refresh_interval_ms: 120000
   drift_threshold_factor: 0.25
   ws_host: wss://ws-subscriptions-clob.polymarket.com/ws/market
   ws_user_host: wss://ws-subscriptions-clob.polymarket.com/ws/user
   fill_poll_interval_ms: 3000
 
 markets:
-  - url: https://polymarket.com/zh/event/wti-closes-above-on-april-23-2026/wti-closes-above-93-on-april-23-2026
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-nuclear-or-nuke-be-said-on-iceman
     # Optional per-market overrides:
     # min_size: 50
     # fallback_v: 0.035
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-pinocchio-be-said-on-iceman
+
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-batman-be-said-on-iceman
+
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-no-no-no-be-said-on-iceman
+
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-armani-be-said-on-iceman
+
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-caleb-be-said-on-iceman
+
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-super-bowl-be-said-on-iceman
+
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-daddy-be-said-on-iceman
+
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-kanye-be-said-on-iceman
+
+  - url: https://polymarket.com/event/what-will-be-said-on-iceman/will-virgil-be-said-on-iceman

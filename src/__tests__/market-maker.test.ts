@@ -141,8 +141,7 @@ describe('MarketMaker', () => {
     expect(cancelMarketOrdersMock).toHaveBeenCalledWith(cfg.condition_id);
   });
 
-  it('cancels on proximity and requotes after the 5s cooldown when the gate passes', async () => {
-    jest.useFakeTimers();
+  it('cancels on proximity and requotes immediately', async () => {
     cancelMarketOrdersMock.mockResolvedValue(true);
     getMarketInfoMock.mockResolvedValue({ v: 0.045, tick_size: 0.01 });
     getRestMidMock.mockResolvedValue(0.5);
@@ -168,26 +167,13 @@ describe('MarketMaker', () => {
     await flushPromises();
     await flushPromises();
 
-    expect(cancelMarketOrdersMock).toHaveBeenCalledTimes(2);
-    expect(placeLimitOrderMock).toHaveBeenCalledTimes(2);
-
-    jest.advanceTimersByTime(4999);
-    await flushPromises();
-    expect(placeLimitOrderMock).toHaveBeenCalledTimes(2);
-
-    jest.advanceTimersByTime(1);
-    await flushPromises();
-    await flushPromises();
-
     expect(cancelMarketOrdersMock).toHaveBeenCalledTimes(3);
     expect(placeLimitOrderMock).toHaveBeenCalledTimes(4);
 
     maker.stop();
-    jest.useRealTimers();
   });
 
-  it('keeps waiting after cooldown until band depth and spread checks pass again', async () => {
-    jest.useFakeTimers();
+  it('requotes on proximity even when market depth would previously block a cooldown gate', async () => {
     cancelMarketOrdersMock.mockResolvedValue(true);
     getMarketInfoMock.mockResolvedValue({ v: 0.045, tick_size: 0.01 });
     getRestMidMock.mockResolvedValue(0.5);
@@ -210,29 +196,15 @@ describe('MarketMaker', () => {
     await flushPromises();
     await flushPromises();
 
-    emitQuote(wsManager, cfg.no_token_id, 0.53, 0.54, 80);
-    emitQuote(wsManager, cfg.yes_token_id, 0.46, 0.47, 80);
+    emitQuote(wsManager, cfg.no_token_id, 0.53, 0.54, 5);
+    emitQuote(wsManager, cfg.yes_token_id, 0.46, 0.47, 5);
     await flushPromises();
     await flushPromises();
 
-    jest.advanceTimersByTime(5000);
-    await flushPromises();
-    await flushPromises();
-
-    expect(placeLimitOrderMock).toHaveBeenCalledTimes(2);
-
-    emitQuote(wsManager, cfg.no_token_id, 0.53, 0.54, 120);
-    await flushPromises();
-    await flushPromises();
-    expect(placeLimitOrderMock).toHaveBeenCalledTimes(2);
-
-    emitQuote(wsManager, cfg.yes_token_id, 0.46, 0.47, 120);
-    await flushPromises();
-    await flushPromises();
+    expect(cancelMarketOrdersMock).toHaveBeenCalledTimes(3);
     expect(placeLimitOrderMock).toHaveBeenCalledTimes(4);
 
     maker.stop();
-    jest.useRealTimers();
   });
 
   it('keeps fill tracking alive while a drift cancel is still in flight', async () => {
