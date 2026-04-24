@@ -55,6 +55,14 @@ export interface QuoteUpdate {
   book: OrderBook | null;
 }
 
+export interface ManagedPosition {
+  conditionId: string;
+  tokenId: string;
+  outcome: 'YES' | 'NO';
+  size: number;
+  avgPrice: number;
+}
+
 /** Tracked order placed by MarketMaker, used by PositionMonitor for fill detection. */
 export interface TrackedOrder {
   orderId: string;

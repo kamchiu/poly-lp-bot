@@ -1,5 +1,7 @@
+import * as https from 'https';
 import { ethers } from 'ethers';
 import { ClobClient, Side, SignatureType, AssetType } from '@polymarket/clob-client';
+import { ManagedPosition } from './types';
 import logger from './logger';
 
 export interface MarketInfo {
@@ -8,11 +10,23 @@ export interface MarketInfo {
   rewards_daily_rate?: number;
 }
 
+interface RawCurrentPosition {
+  asset?: unknown;
+  avgPrice?: unknown;
+  avg_price?: unknown;
+  conditionId?: unknown;
+  condition_id?: unknown;
+  outcome?: unknown;
+  size?: unknown;
+}
+
 let client: ClobClient;
 let heartbeatTimer: NodeJS.Timeout | null = null;
 let heartbeatInFlight: Promise<void> | null = null;
 let lastHeartbeatId: string | null = null;
 let storedApiCreds: { key: string; secret: string; passphrase: string } | null = null;
+
+const DATA_API_HOST = 'https://data-api.polymarket.com';
 
 export async function initClient(host: string, chainId: number, privateKey: string): Promise<void> {
   const signer = new ethers.Wallet(privateKey);
@@ -84,6 +98,44 @@ export function stopHeartbeat(): void {
 export function getApiCreds(): { key: string; secret: string; passphrase: string } {
   if (!storedApiCreds) throw new Error('[Client] getApiCreds called before initClient');
   return storedApiCreds;
+}
+
+export function getPositionsUserAddress(privateKey: string): string {
+  return process.env.POLYMARKET_PROXY_ADDRESS ?? new ethers.Wallet(privateKey).address;
+}
+
+export async function getCurrentPositionForMarket(
+  userAddress: string,
+  conditionId: string,
+  yesTokenId: string,
+  noTokenId: string,
+): Promise<ManagedPosition | null> {
+  const url = new URL(`${DATA_API_HOST}/positions`);
+  url.searchParams.set('user', userAddress);
+  url.searchParams.set('market', conditionId);
+  url.searchParams.set('sizeThreshold', '0');
+
+  const payload = await httpsGetJson(url.toString());
+  if (!Array.isArray(payload)) {
+    throw new Error('[Client] Positions API returned a non-array response');
+  }
+
+  const positions = payload
+    .map(item => normalizeManagedPosition(item as RawCurrentPosition, conditionId, yesTokenId, noTokenId))
+    .filter((item): item is ManagedPosition => item !== null);
+
+  if (positions.length === 0) {
+    return null;
+  }
+
+  if (positions.length > 1) {
+    const outcomes = positions.map(position => position.outcome).join(', ');
+    throw new Error(
+      `[Client] Expected at most one open position in ${conditionId.slice(0, 10)}..., got ${positions.length} (${outcomes})`
+    );
+  }
+
+  return positions[0];
 }
 
 export async function getMarketInfo(conditionId: string, fallbackV: number): Promise<MarketInfo> {
@@ -273,4 +325,88 @@ export async function getTokenBalanceStrict(tokenId: string): Promise<number> {
   const balance = parseFloat(bal.balance) || 0;
   logger.debug(`[Client] Token balance for ${tokenId.slice(0, 10)}...: ${balance}`);
   return balance;
+}
+
+function normalizeManagedPosition(
+  position: RawCurrentPosition,
+  conditionId: string,
+  yesTokenId: string,
+  noTokenId: string,
+): ManagedPosition | null {
+  const size = parseNumber(position.size);
+  const avgPrice = parseNumber(position.avgPrice ?? position.avg_price);
+  if (size <= 0 || avgPrice <= 0) {
+    return null;
+  }
+
+  const assetId = typeof position.asset === 'string' ? position.asset : '';
+  const responseConditionId = typeof position.conditionId === 'string'
+    ? position.conditionId
+    : typeof position.condition_id === 'string'
+      ? position.condition_id
+      : conditionId;
+  if (responseConditionId !== conditionId) {
+    return null;
+  }
+
+  let outcome: ManagedPosition['outcome'] | null = null;
+  if (assetId === yesTokenId) {
+    outcome = 'YES';
+  } else if (assetId === noTokenId) {
+    outcome = 'NO';
+  } else if (typeof position.outcome === 'string') {
+    const normalizedOutcome = position.outcome.trim().toUpperCase();
+    if (normalizedOutcome === 'YES' || normalizedOutcome === 'NO') {
+      outcome = normalizedOutcome;
+    }
+  }
+
+  if (!outcome) {
+    return null;
+  }
+
+  return {
+    conditionId,
+    tokenId: outcome === 'YES' ? yesTokenId : noTokenId,
+    outcome,
+    size,
+    avgPrice,
+  };
+}
+
+function parseNumber(value: unknown): number {
+  const parsed = parseFloat(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function httpsGetJson(url: string): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const proxyUrl =
+      process.env.https_proxy ??
+      process.env.HTTPS_PROXY ??
+      process.env.http_proxy ??
+      process.env.HTTP_PROXY;
+    const options: https.RequestOptions = proxyUrl
+      ? { agent: new (require('https-proxy-agent').HttpsProxyAgent)(proxyUrl) }
+      : {};
+
+    const req = https.get(url, options, res => {
+      let raw = '';
+      res.on('data', chunk => {
+        raw += chunk;
+      });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(raw));
+        } catch (error) {
+          reject(new Error(`JSON parse error for ${url}: ${(error as Error).message}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10_000, () => {
+      req.destroy(new Error(`Request timed out: ${url}`));
+    });
+  });
 }
