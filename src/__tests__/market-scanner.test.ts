@@ -3,6 +3,7 @@ jest.mock('https-proxy-agent', () => ({
 }));
 
 import { MarketReward, passesManualSelection, scoreMarket, selectMarkets } from '../market-scanner';
+import { buildMultiRewardsUrl } from '../market-scanner';
 
 function buildReward(overrides: Partial<MarketReward> = {}): MarketReward {
   return {
@@ -35,6 +36,20 @@ function buildReward(overrides: Partial<MarketReward> = {}): MarketReward {
 }
 
 describe('market-scanner manual filters', () => {
+  it('pushes volume filters into the rewards multi query string', () => {
+    const url = buildMultiRewardsUrl({
+      minVolume24h: 0,
+      maxVolume24h: 100,
+      nextCursor: 'cursor-1',
+      pageSize: 500,
+    });
+
+    expect(url).toContain('page_size=500');
+    expect(url).toContain('next_cursor=cursor-1');
+    expect(url).toContain('min_volume_24hr=0');
+    expect(url).toContain('max_volume_24hr=100');
+  });
+
   it('keeps only explicitly whitelisted markets when a whitelist is provided', () => {
     const reward = buildReward({ market_slug: 'keep-me' });
 

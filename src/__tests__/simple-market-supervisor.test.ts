@@ -305,7 +305,10 @@ describe('SimpleMarketSupervisor', () => {
 
 describe('buildSimpleRuntimeScanOptions', () => {
   it('adds a count limit when market_count is a positive number', () => {
-    expect(buildSimpleRuntimeScanOptions(5).count).toBe(5);
+    const options = buildSimpleRuntimeScanOptions(5);
+    expect(options.count).toBe(5);
+    expect(options.minVolume24h).toBe(0);
+    expect(options.maxVolume24h).toBe(100);
   });
 
   it('leaves count unset when market_count is null or invalid', () => {

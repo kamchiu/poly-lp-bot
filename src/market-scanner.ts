@@ -134,7 +134,32 @@ interface PaginationPayload {
   data: MarketReward[];
 }
 
-async function fetchAllMultiRewards(): Promise<MarketReward[]> {
+export function buildMultiRewardsUrl(
+  options: {
+    minVolume24h?: number;
+    maxVolume24h?: number;
+    nextCursor?: string;
+    pageSize?: number;
+  } = {}
+): string {
+  const params = new URLSearchParams();
+  params.set('page_size', String(options.pageSize ?? 500));
+  params.set('next_cursor', options.nextCursor ?? 'MA==');
+
+  if (typeof options.minVolume24h === 'number' && Number.isFinite(options.minVolume24h)) {
+    params.set('min_volume_24hr', String(options.minVolume24h));
+  }
+  if (typeof options.maxVolume24h === 'number' && Number.isFinite(options.maxVolume24h)) {
+    params.set('max_volume_24hr', String(options.maxVolume24h));
+  }
+
+  return `${CLOB_HOST}/rewards/markets/multi?${params.toString()}`;
+}
+
+async function fetchAllMultiRewards(options: {
+  minVolume24h?: number;
+  maxVolume24h?: number;
+} = {}): Promise<MarketReward[]> {
   const pageSize = 500;
   const endCursor = 'LTE=';
 
@@ -142,10 +167,15 @@ async function fetchAllMultiRewards(): Promise<MarketReward[]> {
   let nextCursor = 'MA==';
 
   while (nextCursor !== endCursor) {
-    const url = `${CLOB_HOST}/rewards/markets/multi?page_size=${pageSize}&next_cursor=${encodeURIComponent(nextCursor)}`;
+    const url = buildMultiRewardsUrl({
+      pageSize,
+      nextCursor,
+      minVolume24h: options.minVolume24h,
+      maxVolume24h: options.maxVolume24h,
+    });
     const resp = await httpsGet(url) as PaginationPayload;
     if (!Array.isArray(resp.data) || resp.data.length === 0) break;
-    results = [...results, ...resp.data];
+    results.push(...resp.data);
     nextCursor = resp.next_cursor ?? endCursor;
   }
 
@@ -618,8 +648,15 @@ export async function selectMarkets(
 export async function scanMarkets(
   options: ScanMarketsOptions = {}
 ): Promise<ScoredMarket[]> {
-  const rewards = await fetchAllMultiRewards();
-  return await selectMarkets(rewards, options);
+  const resolvedFilters = resolveScanFilters(options);
+  const rewards = await fetchAllMultiRewards({
+    minVolume24h: resolvedFilters.minVolume24h,
+    maxVolume24h: resolvedFilters.maxVolume24h,
+  });
+  return await selectMarkets(rewards, {
+    ...options,
+    ...resolvedFilters,
+  });
 }
 
 export function buildMarketConfigEntry(scoredMarket: ScoredMarket): MarketConfig {

@@ -25,7 +25,7 @@ export const SIMPLE_RUNTIME_SCAN_OPTIONS: Readonly<ScanMarketsOptions> = {
   maxDailyRate: Number.POSITIVE_INFINITY,
   maxMinShares: 20,
   minVolume24h: 0,
-  maxVolume24h: Number.POSITIVE_INFINITY,
+  maxVolume24h: 100,
   minDaysToEvent: Number.NEGATIVE_INFINITY,
   minMid: 0,
   maxMid: 1,
