@@ -19,20 +19,20 @@ import { WsManager } from './ws-manager';
 
 const INVENTORY_EPSILON = 1e-6;
 
-export const SIMPLE_SCAN_INTERVAL_MS = 30 * 60 * 1000;
+export const SIMPLE_SCAN_INTERVAL_MS = 15 * 60 * 1000;
 export const SIMPLE_RUNTIME_SCAN_OPTIONS: Readonly<ScanMarketsOptions> = {
   minDailyRate: 20,
   maxDailyRate: Number.POSITIVE_INFINITY,
   maxMinShares: 20,
   minVolume24h: 0,
-  maxVolume24h: 100,
+  maxVolume24h: 200,
   minDaysToEvent: Number.NEGATIVE_INFINITY,
   minMid: 0,
   maxMid: 1,
-  minBestBid: 0.2,
-  maxBestBid: 0.8,
-  minBestAsk: 0.2,
-  maxBestAsk: 0.8,
+  minBestBid: 0.1,
+  maxBestBid: 0.9,
+  minBestAsk: 0.1,
+  maxBestAsk: 0.9,
   exactCompetitiveness: 0,
 };
 
