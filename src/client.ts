@@ -1,6 +1,15 @@
 import * as https from 'https';
-import { ethers } from 'ethers';
-import { ClobClient, Side, SignatureType, AssetType } from '@polymarket/clob-client';
+import {
+  AssetType,
+  Chain,
+  ClobClient,
+  OrderType,
+  Side,
+  SignatureTypeV2,
+  TickSize,
+} from '@polymarket/clob-client-v2';
+import { createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { ManagedPosition } from './types';
 import logger from './logger';
 
@@ -25,15 +34,29 @@ let heartbeatTimer: NodeJS.Timeout | null = null;
 let heartbeatInFlight: Promise<void> | null = null;
 let lastHeartbeatId: string | null = null;
 let storedApiCreds: { key: string; secret: string; passphrase: string } | null = null;
+const tokenTickSizes: Record<string, TickSize> = {};
 
 const DATA_API_HOST = 'https://data-api.polymarket.com';
 
 export async function initClient(host: string, chainId: number, privateKey: string): Promise<void> {
-  const signer = new ethers.Wallet(privateKey);
+  const account = privateKeyToAccount(normalizePrivateKey(privateKey));
+  const signer = createWalletClient({ account, transport: http() });
+  const chain = resolveChain(chainId);
   const proxyAddress = process.env.POLYMARKET_PROXY_ADDRESS;
+  const sigType = resolveSignatureType(proxyAddress);
+  if (sigType !== SignatureTypeV2.EOA && !proxyAddress) {
+    throw new Error('[Client] POLYMARKET_PROXY_ADDRESS is required when POLYMARKET_SIGNATURE_TYPE is not 0');
+  }
+  const baseClientOptions = {
+    host,
+    chain,
+    signer,
+    signatureType: sigType,
+    funderAddress: proxyAddress,
+  };
 
   // Step 1: L1-only client to derive API credentials
-  const l1Client = new ClobClient(host, chainId, signer);
+  const l1Client = new ClobClient(baseClientOptions);
   const apiCreds = await l1Client.createOrDeriveApiKey();
   storedApiCreds = { key: apiCreds.key, secret: apiCreds.secret, passphrase: apiCreds.passphrase };
   logger.info('[Client] API credentials derived');
@@ -41,8 +64,7 @@ export async function initClient(host: string, chainId: number, privateKey: stri
   // Step 2: Full client with correct signature type
   // - POLY_GNOSIS_SAFE (2): Web3 wallet login (OKX, MetaMask) — requires proxyAddress (Polymarket Profile Address)
   // - EOA (0): direct EOA login without proxy
-  const sigType = proxyAddress ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
-  client = new ClobClient(host, chainId, signer, apiCreds, sigType, proxyAddress);
+  client = new ClobClient({ ...baseClientOptions, creds: apiCreds, retryOnError: true });
   logger.info(`[Client] Using signatureType=${sigType} proxyAddress=${proxyAddress ?? 'none (EOA mode)'}`);
 
   // Log USDC balance and allowance so misconfigured accounts are caught early
@@ -65,7 +87,7 @@ export async function initClient(host: string, chainId: number, privateKey: stri
 
     heartbeatInFlight = (async () => {
       try {
-        const resp = await client.postHeartbeat(lastHeartbeatId);
+        const resp = await client.postHeartbeat(lastHeartbeatId ?? undefined);
         const r = resp as any;
         if (r.error || r.status >= 400) {
           // Chain broke — start a new one
@@ -101,7 +123,7 @@ export function getApiCreds(): { key: string; secret: string; passphrase: string
 }
 
 export function getPositionsUserAddress(privateKey: string): string {
-  return process.env.POLYMARKET_PROXY_ADDRESS ?? new ethers.Wallet(privateKey).address;
+  return process.env.POLYMARKET_PROXY_ADDRESS ?? privateKeyToAccount(normalizePrivateKey(privateKey)).address;
 }
 
 export async function getCurrentPositionForMarket(
@@ -140,9 +162,16 @@ export async function getCurrentPositionForMarket(
 
 export async function getMarketInfo(conditionId: string, fallbackV: number): Promise<MarketInfo> {
   try {
-    const market = await client.getMarket(conditionId);
-    const m = market as any;
-    const tick_size = parseFloat(m.minimum_tick_size) || 0.01;
+    const marketInfo = await client.getClobMarketInfo(conditionId);
+    const tickSize = toTickSize(marketInfo.mts);
+    const tick_size = tickSize ? parseFloat(tickSize) : parseNumber(marketInfo.mts) || 0.01;
+    if (tickSize) {
+      for (const token of marketInfo.t) {
+        if (token?.t) {
+          tokenTickSizes[token.t] = tickSize;
+        }
+      }
+    }
 
     // max_spread comes from the rewards API, not getMarket
     let v = fallbackV;
@@ -228,13 +257,16 @@ export async function placeLimitOrder(
   tokenId: string
 ): Promise<PlacedOrder | null> {
   try {
-    const order = await client.createOrder({
-      tokenID: tokenId,
-      price,
-      side: side === 'BUY' ? Side.BUY : Side.SELL,
-      size,
-    });
-    const resp = await client.postOrder(order, 'GTC' as any);
+    const resp = await client.createAndPostOrder(
+      {
+        tokenID: tokenId,
+        price,
+        side: side === 'BUY' ? Side.BUY : Side.SELL,
+        size,
+      },
+      getCreateOrderOptions(tokenId),
+      OrderType.GTC,
+    );
     const r = resp as any;
     const responseStatus = typeof r.status === 'string' ? r.status : 'unknown';
     const responseOrderId = r.orderID ?? r.order_id ?? 'missing';
@@ -242,7 +274,7 @@ export async function placeLimitOrder(
       `[Client] postOrder response side=${side} price=${price} size=${size} ` +
       `token=${tokenId.slice(0, 10)}... status=${responseStatus} orderId=${responseOrderId} payload=${JSON.stringify(r)}`
     );
-    if (r.error) {
+    if (r.error || r.success === false) {
       const msg = r.error ?? r.errorMsg ?? 'unknown error';
       logger.warn(`[Client] placeLimitOrder rejected ${side}@${price}: ${msg} (status=${r.status})`);
       return null;
@@ -377,6 +409,41 @@ function normalizeManagedPosition(
 function parseNumber(value: unknown): number {
   const parsed = parseFloat(String(value));
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizePrivateKey(privateKey: string): `0x${string}` {
+  return privateKey.startsWith('0x') ? privateKey as `0x${string}` : `0x${privateKey}`;
+}
+
+function resolveChain(chainId: number): Chain {
+  if (chainId === Chain.POLYGON) return Chain.POLYGON;
+  if (chainId === Chain.AMOY) return Chain.AMOY;
+  throw new Error(`[Client] Unsupported CLOB V2 chainId=${chainId}`);
+}
+
+function resolveSignatureType(proxyAddress: string | undefined): SignatureTypeV2 {
+  const configured = process.env.POLYMARKET_SIGNATURE_TYPE?.trim();
+  if (configured) {
+    if (configured === '0') return SignatureTypeV2.EOA;
+    if (configured === '1') return SignatureTypeV2.POLY_PROXY;
+    if (configured === '2') return SignatureTypeV2.POLY_GNOSIS_SAFE;
+    if (configured === '3') return SignatureTypeV2.POLY_1271;
+    throw new Error(`[Client] Unsupported POLYMARKET_SIGNATURE_TYPE=${configured}`);
+  }
+
+  return proxyAddress ? SignatureTypeV2.POLY_GNOSIS_SAFE : SignatureTypeV2.EOA;
+}
+
+function getCreateOrderOptions(tokenId: string): { tickSize: TickSize } | undefined {
+  const tickSize = tokenTickSizes[tokenId];
+  return tickSize ? { tickSize } : undefined;
+}
+
+function toTickSize(value: unknown): TickSize | undefined {
+  const tickSize = String(value);
+  return tickSize === '0.1' || tickSize === '0.01' || tickSize === '0.001' || tickSize === '0.0001'
+    ? tickSize
+    : undefined;
 }
 
 function httpsGetJson(url: string): Promise<unknown> {

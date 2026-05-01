@@ -17,13 +17,13 @@
     "test:coverage": "jest --coverage"
   },
   "dependencies": {
-    "@polymarket/clob-client": "latest",
+    "@polymarket/clob-client-v2": "^1.0.2",
     "@types/node-telegram-bot-api": "^0.64.14",
     "dotenv": "^16",
-    "ethers": "^5",
     "https-proxy-agent": "^9.0.0",
     "js-yaml": "^4",
     "node-telegram-bot-api": "^0.67.0",
+    "viem": "^2.48.4",
     "winston": "^3",
     "ws": "^8"
   },

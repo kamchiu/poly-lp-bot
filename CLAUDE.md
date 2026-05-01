@@ -48,7 +48,7 @@ client.ts (module-level singleton)
 
 ### Key design decisions
 
-**`client.ts`** is a module-level singleton (not a class). `initClient()` must be called once before any other exported functions are used. Auth requires two `ClobClient` instances: the first (L1 only) calls `createOrDeriveApiKey()`, then a second is constructed with those creds and `SignatureType.EOA`.
+**`client.ts`** is a module-level singleton (not a class). `initClient()` must be called once before any other exported functions are used. Auth requires two CLOB V2 `ClobClient` instances: the first (L1 only) calls `createOrDeriveApiKey()`, then a second is constructed with those creds. EOA mode uses `SignatureTypeV2.EOA`; `POLYMARKET_PROXY_ADDRESS` defaults to `SignatureTypeV2.POLY_GNOSIS_SAFE` with `funderAddress`. `POLYMARKET_SIGNATURE_TYPE` can override the signature type when a proxy wallet needs type 1 or 3.
 
 **`WsManager`** subscribes to the `book` channel for all token IDs over a single connection. It handles: exponential backoff reconnect (1s → 60s max), stale detection (30s no message → terminate), and WS-level ping every 10s. On reconnect it re-sends the subscribe message and emits `'connected'` so all `MarketMaker` instances requote immediately.
 
@@ -56,9 +56,10 @@ client.ts (module-level singleton)
 
 **`config.yaml`** has a `defaults` block and a `markets` array. The recommended setup is to put shared values like `min_size`, `fallback_v`, and timing knobs in `defaults`, then list markets by `url`. `resolveMarketIds()` fills in token/condition IDs from the URL, and `resolveMarketConfig()` merges defaults with any per-market overrides into a `ResolvedMarketConfig`.
 
-### `@polymarket/clob-client` notes
+### `@polymarket/clob-client-v2` notes
 
-- Market fields accessed as `any` casts: `max_spread`, `minimum_tick_size`, `rewards_daily_rate`
+- `initClient()` builds a viem wallet client with `privateKeyToAccount()` and passes a V2 options object into `new ClobClient(...)`
+- Market tick size comes from `getClobMarketInfo(conditionId).mts`; rewards spread still comes from `getRawRewardsForMarket(conditionId)`
 - `cancelMarketOrders({ market: conditionId })` — requires the `market` key
-- `postOrder(order, 'GTC')` — time-in-force passed as string with `as any`
+- `placeLimitOrder()` uses `createAndPostOrder(..., OrderType.GTC)` and passes cached `{ tickSize }` when available
 - Order ID in response is `orderID` or `order_id` depending on version
