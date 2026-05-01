@@ -22,6 +22,11 @@ jest.mock('viem/accounts', () => ({
   }),
 }));
 
+jest.mock('viem/chains', () => ({
+  polygon: { id: 137, name: 'Polygon' },
+  polygonAmoy: { id: 80002, name: 'Polygon Amoy' },
+}));
+
 jest.mock('https', () => ({
   get: jest.fn(),
 }));
@@ -164,6 +169,7 @@ describe('client position helpers', () => {
     expect(httpMock).toHaveBeenCalledTimes(1);
     expect(createWalletClientMock).toHaveBeenCalledWith({
       account: { address: '0xeoa000000000000000000000000000000000000' },
+      chain: { id: 137, name: 'Polygon' },
       transport: { transport: true },
     });
     expect(ClobClientMock).toHaveBeenNthCalledWith(1, expect.objectContaining({
@@ -223,6 +229,23 @@ describe('client position helpers', () => {
     await expect(initClient('https://clob.polymarket.com', 137, 'abc123')).rejects.toThrow(
       'POLYMARKET_PROXY_ADDRESS is required'
     );
+  });
+
+  it('uses the Amoy viem chain for Amoy CLOB chain IDs', async () => {
+    const l1Client = buildL1ClientMock();
+    const l2Client = buildL2ClientMock();
+
+    ClobClientMock
+      .mockImplementationOnce(() => l1Client as unknown as ClobClient)
+      .mockImplementationOnce(() => l2Client as unknown as ClobClient);
+
+    await initClient('https://clob.polymarket.com', 80002, 'abc123');
+
+    expect(createWalletClientMock).toHaveBeenCalledWith({
+      account: { address: '0xeoa000000000000000000000000000000000000' },
+      chain: { id: 80002, name: 'Polygon Amoy' },
+      transport: { transport: true },
+    });
   });
 
   it('places GTC orders through the V2 atomic create/post API', async () => {

@@ -8,8 +8,9 @@ import {
   SignatureTypeV2,
   TickSize,
 } from '@polymarket/clob-client-v2';
-import { createWalletClient, http } from 'viem';
+import { createWalletClient, http, type Chain as ViemChain } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { polygon, polygonAmoy } from 'viem/chains';
 import { ManagedPosition } from './types';
 import logger from './logger';
 
@@ -40,8 +41,8 @@ const DATA_API_HOST = 'https://data-api.polymarket.com';
 
 export async function initClient(host: string, chainId: number, privateKey: string): Promise<void> {
   const account = privateKeyToAccount(normalizePrivateKey(privateKey));
-  const signer = createWalletClient({ account, transport: http() });
   const chain = resolveChain(chainId);
+  const signer = createWalletClient({ account, chain: resolveViemChain(chainId), transport: http() });
   const proxyAddress = process.env.POLYMARKET_PROXY_ADDRESS;
   const sigType = resolveSignatureType(proxyAddress);
   if (sigType !== SignatureTypeV2.EOA && !proxyAddress) {
@@ -419,6 +420,12 @@ function resolveChain(chainId: number): Chain {
   if (chainId === Chain.POLYGON) return Chain.POLYGON;
   if (chainId === Chain.AMOY) return Chain.AMOY;
   throw new Error(`[Client] Unsupported CLOB V2 chainId=${chainId}`);
+}
+
+function resolveViemChain(chainId: number): ViemChain {
+  if (chainId === Chain.POLYGON) return polygon;
+  if (chainId === Chain.AMOY) return polygonAmoy;
+  throw new Error(`[Client] Unsupported viem chainId=${chainId}`);
 }
 
 function resolveSignatureType(proxyAddress: string | undefined): SignatureTypeV2 {
